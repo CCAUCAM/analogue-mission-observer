@@ -4,10 +4,11 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /* =======================
    GOOGLE SHEETS (NO AUTH)
-   - Paste your Apps Script Web App URL below
+   - Using no-cors to avoid browser CORS blocking with Apps Script
 ======================= */
 
-const SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
+const SHEETS_WEBHOOK_URL =
+  "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
 
 /* =======================
    TYPES & CONSTANTS
@@ -76,7 +77,7 @@ type Marker = {
   zone: string; // derived
   note: string;
 
-  // cloud write status (optional)
+  // cloud write status for UI feedback
   cloudStatus?: "pending" | "ok" | "fail";
 };
 
@@ -184,28 +185,19 @@ const styles = {
 };
 
 /* =======================
-   CLOUD WRITE (Sheets)
+   CLOUD WRITE (Sheets, no-cors)
 ======================= */
 
 async function sendToSheets(payload: Record<string, any>) {
-  if (!SHEETS_WEBHOOK_URL || SHEETS_WEBHOOK_URL.includes("PASTE_YOUR")) return;
+  if (!SHEETS_WEBHOOK_URL) return;
 
-  // Fire-and-forget, but still return success/fail if awaited
-  const res = await fetch(SHEETS_WEBHOOK_URL, {
+  // no-cors avoids browser CORS/preflight problems with Apps Script
+  // Tradeoff: we can't read/verify the response. Good for "no protection" pilot mode.
+  await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    mode: "no-cors",
     body: JSON.stringify(payload),
   });
-
-  // Apps Script returns JSON: { ok: true } or { ok: false, error: ... }
-  const text = await res.text();
-  try {
-    const parsed = JSON.parse(text);
-    if (!parsed.ok) throw new Error(parsed.error || "Sheets write failed");
-  } catch {
-    // If parsing fails, still treat as failure so you can see it.
-    throw new Error("Sheets response was not valid JSON");
-  }
 }
 
 /* =======================
@@ -394,48 +386,48 @@ export default function Page() {
       cloudStatus: "pending",
     };
 
-    // Show marker immediately (optimistic UI)
+    // Optimistic UI
     setMarkers((prev) => [...prev, base]);
     setLastRecorded(
-      `Recorded: badge ${base.badgeNumber} · ${ROLES.find((r) => r.key === base.role)?.label} · ${selectedActivityMeta.label} · ${base.zone}`
+      `Recorded: badge ${base.badgeNumber} · ${
+        ROLES.find((r) => r.key === base.role)?.label
+      } · ${selectedActivityMeta.label} · ${base.zone}`
     );
 
-    // Send to Sheets
-    try {
-      await sendToSheets({
-        created_at_iso: new Date(base.createdAt).toISOString(),
-        observer: base.observerName,
-        site: base.buildingSite,
-        interval_minutes: intervalMinutes,
-        interval_index: base.intervalIndex,
-        interval_label: base.intervalLabel,
-        badge: base.badgeNumber,
-        role: base.role,
-        activity: base.activity,
-        group: base.isGroup,
-        x_norm: base.x,
-        y_norm: base.y,
-        zone: base.zone,
-        note: base.note,
+    // Send to Sheets (no-cors). If network fails, we can catch that.
+    sendToSheets({
+      created_at_iso: new Date(base.createdAt).toISOString(),
+      observer: base.observerName,
+      site: base.buildingSite,
+      interval_minutes: intervalMinutes,
+      interval_index: base.intervalIndex,
+      interval_label: base.intervalLabel,
+      badge: base.badgeNumber,
+      role: base.role,
+      activity: base.activity,
+      group: base.isGroup,
+      x_norm: base.x,
+      y_norm: base.y,
+      zone: base.zone,
+      note: base.note,
+    })
+      .then(() => {
+        setMarkers((prev) => {
+          const copy = [...prev];
+          const idx = copy.findIndex((m) => m.id === base.id);
+          if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "ok" };
+          return copy;
+        });
+      })
+      .catch(() => {
+        setMarkers((prev) => {
+          const copy = [...prev];
+          const idx = copy.findIndex((m) => m.id === base.id);
+          if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "fail" };
+          return copy;
+        });
+        setStatusMsg("Saved locally; cloud may not have received it.");
       });
-
-      // Update last marker cloud status to ok
-      setMarkers((prev) => {
-        const copy = [...prev];
-        const idx = copy.findIndex((m) => m.id === base.id);
-        if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "ok" };
-        return copy;
-      });
-    } catch (err: any) {
-      setMarkers((prev) => {
-        const copy = [...prev];
-        const idx = copy.findIndex((m) => m.id === base.id);
-        if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "fail" };
-        return copy;
-      });
-      setStatusMsg(`Saved locally, but cloud write failed.`);
-      // (We keep it local regardless, so you never lose the observation.)
-    }
   }
 
   const thisIntervalCount = useMemo(
@@ -659,7 +651,7 @@ export default function Page() {
               <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div>
             ) : null}
             <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-              Cloud: using Google Sheets webhook {SHEETS_WEBHOOK_URL.includes("PASTE_YOUR") ? "(not set yet)" : "(active)"}.
+              Cloud logging: Google Sheets (no-auth).
             </div>
           </div>
         </div>
@@ -709,10 +701,10 @@ export default function Page() {
               const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
               const ring =
                 m.cloudStatus === "ok"
-                  ? "2px solid rgba(34,197,94,0.9)" // green ring
+                  ? "2px solid rgba(34,197,94,0.9)"
                   : m.cloudStatus === "fail"
-                  ? "2px solid rgba(239,68,68,0.95)" // red ring
-                  : "2px solid rgba(255,255,255,0.95)"; // pending/unknown
+                  ? "2px solid rgba(239,68,68,0.95)"
+                  : "2px solid rgba(255,255,255,0.95)";
 
               return (
                 <div
