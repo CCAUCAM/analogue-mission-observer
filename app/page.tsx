@@ -404,7 +404,7 @@ export default function Page() {
           <div style={{ fontWeight: 800, fontSize: 16 }}>
             Analogue Mission Observation Mapper
           </div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>Cambridge Cognitive Architecture</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>University of Cambridge</div>
         </div>
       </header>
 
