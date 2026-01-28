@@ -3,6 +3,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /* =======================
+   GOOGLE SHEETS (NO AUTH)
+   - Paste your Apps Script Web App URL below
+======================= */
+
+const SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
+
+/* =======================
    TYPES & CONSTANTS
 ======================= */
 
@@ -68,6 +75,9 @@ type Marker = {
 
   zone: string; // derived
   note: string;
+
+  // cloud write status (optional)
+  cloudStatus?: "pending" | "ok" | "fail";
 };
 
 /* =======================
@@ -85,16 +95,7 @@ type ZoneRect = {
   y2: number;
 };
 
-/**
- * IMPORTANT:
- * These are placeholder rectangles.
- * You’ll edit them to match your plan layout.
- *
- * Tip: Start with 6–10 big zones (Atrium, Lab, Hygiene, Dormitory, etc.)
- * then refine later.
- */
 const ZONES: ZoneRect[] = [
-  // Example rough blocks (EDIT!)
   { name: "Atrium/Operations", x1: 0.34, y1: 0.30, x2: 0.56, y2: 0.64 },
   { name: "Storage/Technical", x1: 0.30, y1: 0.05, x2: 0.52, y2: 0.30 },
   { name: "Hygiene Module", x1: 0.58, y1: 0.58, x2: 0.96, y2: 0.78 },
@@ -180,16 +181,32 @@ const styles = {
     fontWeight: 700,
     cursor: "pointer",
   } as React.CSSProperties,
-  buttonGhost: {
-    padding: "10px 14px",
-    borderRadius: 10,
-    border: "1px solid transparent",
-    background: "transparent",
-    color: "#111",
-    fontWeight: 700,
-    cursor: "pointer",
-  } as React.CSSProperties,
 };
+
+/* =======================
+   CLOUD WRITE (Sheets)
+======================= */
+
+async function sendToSheets(payload: Record<string, any>) {
+  if (!SHEETS_WEBHOOK_URL || SHEETS_WEBHOOK_URL.includes("PASTE_YOUR")) return;
+
+  // Fire-and-forget, but still return success/fail if awaited
+  const res = await fetch(SHEETS_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  // Apps Script returns JSON: { ok: true } or { ok: false, error: ... }
+  const text = await res.text();
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed.ok) throw new Error(parsed.error || "Sheets write failed");
+  } catch {
+    // If parsing fails, still treat as failure so you can see it.
+    throw new Error("Sheets response was not valid JSON");
+  }
+}
 
 /* =======================
    MAIN COMPONENT
@@ -217,7 +234,6 @@ export default function Page() {
 
   const [markers, setMarkers] = useState<Marker[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>("");
-
   const [lastRecorded, setLastRecorded] = useState<string>("");
 
   // Keep timeLeft synced when not running
@@ -270,7 +286,6 @@ export default function Page() {
 
   function pauseResume() {
     if (!isRunning) {
-      // resume: restart interval from now
       const now = Date.now();
       setIntervalStart(now);
       setTimeLeft(intervalSeconds);
@@ -308,6 +323,7 @@ export default function Page() {
       "y_norm",
       "zone",
       "note",
+      "cloud_status",
     ];
 
     const rows = markers.map((m) => {
@@ -326,6 +342,7 @@ export default function Page() {
         m.y.toFixed(6),
         m.zone,
         m.note ?? "",
+        m.cloudStatus ?? "",
       ].map(csvEscape);
     });
 
@@ -337,7 +354,7 @@ export default function Page() {
     a.click();
   }
 
-  function handleClick(e: React.MouseEvent) {
+  async function handleClick(e: React.MouseEvent) {
     setStatusMsg("");
 
     if (!isRunning || intervalStart === null) {
@@ -359,7 +376,7 @@ export default function Page() {
 
     const zone = zoneForPoint(x, y);
 
-    const m: Marker = {
+    const base: Marker = {
       id: uid(),
       createdAt: Date.now(),
       intervalIndex,
@@ -374,12 +391,51 @@ export default function Page() {
       y,
       zone,
       note,
+      cloudStatus: "pending",
     };
 
-    setMarkers((prev) => [...prev, m]);
+    // Show marker immediately (optimistic UI)
+    setMarkers((prev) => [...prev, base]);
     setLastRecorded(
-      `Recorded: badge ${m.badgeNumber} · ${ROLES.find((r) => r.key === m.role)?.label} · ${selectedActivityMeta.label} · ${m.zone}`
+      `Recorded: badge ${base.badgeNumber} · ${ROLES.find((r) => r.key === base.role)?.label} · ${selectedActivityMeta.label} · ${base.zone}`
     );
+
+    // Send to Sheets
+    try {
+      await sendToSheets({
+        created_at_iso: new Date(base.createdAt).toISOString(),
+        observer: base.observerName,
+        site: base.buildingSite,
+        interval_minutes: intervalMinutes,
+        interval_index: base.intervalIndex,
+        interval_label: base.intervalLabel,
+        badge: base.badgeNumber,
+        role: base.role,
+        activity: base.activity,
+        group: base.isGroup,
+        x_norm: base.x,
+        y_norm: base.y,
+        zone: base.zone,
+        note: base.note,
+      });
+
+      // Update last marker cloud status to ok
+      setMarkers((prev) => {
+        const copy = [...prev];
+        const idx = copy.findIndex((m) => m.id === base.id);
+        if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "ok" };
+        return copy;
+      });
+    } catch (err: any) {
+      setMarkers((prev) => {
+        const copy = [...prev];
+        const idx = copy.findIndex((m) => m.id === base.id);
+        if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "fail" };
+        return copy;
+      });
+      setStatusMsg(`Saved locally, but cloud write failed.`);
+      // (We keep it local regardless, so you never lose the observation.)
+    }
   }
 
   const thisIntervalCount = useMemo(
@@ -591,8 +647,8 @@ export default function Page() {
           {/* Status line */}
           <div style={{ marginTop: 10, fontSize: 13 }}>
             <span style={{ fontWeight: 800 }}>
-              Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} ·
-              This interval: {thisIntervalCount}
+              Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This
+              interval: {thisIntervalCount}
             </span>
             {statusMsg ? (
               <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 700 }}>
@@ -602,6 +658,9 @@ export default function Page() {
             {lastRecorded ? (
               <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div>
             ) : null}
+            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+              Cloud: using Google Sheets webhook {SHEETS_WEBHOOK_URL.includes("PASTE_YOUR") ? "(not set yet)" : "(active)"}.
+            </div>
           </div>
         </div>
 
@@ -626,13 +685,12 @@ export default function Page() {
             onClick={handleClick}
             style={{
               position: "relative",
-              height: "70vh", // BIGGER + field-friendly
+              height: "70vh",
               minHeight: 520,
               background: "#fafafa",
               cursor: isRunning ? "crosshair" : "not-allowed",
             }}
           >
-            {/* Plan image */}
             <img
               src="/plan.png"
               alt="Floorplan"
@@ -647,13 +705,19 @@ export default function Page() {
               }}
             />
 
-            {/* Dots layer (on top of image) */}
             {markers.map((m) => {
               const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
+              const ring =
+                m.cloudStatus === "ok"
+                  ? "2px solid rgba(34,197,94,0.9)" // green ring
+                  : m.cloudStatus === "fail"
+                  ? "2px solid rgba(239,68,68,0.95)" // red ring
+                  : "2px solid rgba(255,255,255,0.95)"; // pending/unknown
+
               return (
                 <div
                   key={m.id}
-                  title={`Badge ${m.badgeNumber} · ${m.role} · ${m.activity} · ${m.zone} · ${m.intervalLabel}`}
+                  title={`Badge ${m.badgeNumber} · ${m.role} · ${m.activity} · ${m.zone} · ${m.intervalLabel} · cloud=${m.cloudStatus}`}
                   style={{
                     position: "absolute",
                     left: `${m.x * 100}%`,
@@ -663,9 +727,9 @@ export default function Page() {
                     height: 14,
                     borderRadius: 999,
                     background: color,
-                    border: "3px solid #fff",
+                    border: ring,
                     boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
-                    zIndex: 5, // KEY: ensure dots are above the plan
+                    zIndex: 5,
                   }}
                 />
               );
@@ -673,10 +737,9 @@ export default function Page() {
           </div>
         </div>
 
-        {/* ZONES NOTE */}
         <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-          Zones: edit the <b>ZONES</b> array near the top of the file to match your plan. Each zone is a
-          rectangle in normalized coordinates (0..1). CSV includes a <b>zone</b> column.
+          Zones: edit the <b>ZONES</b> array near the top of the file to match your plan. Each zone is
+          a rectangle in normalized coordinates (0..1).
         </div>
       </div>
     </div>
