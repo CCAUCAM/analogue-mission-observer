@@ -13,8 +13,8 @@ const SHEETS_WEBHOOK_URL =
    STORAGE KEYS
 ======================= */
 
-const LS_ZONES_KEY = "cca_obs_zones_v1";
-const LS_MARKERS_KEY = "cca_obs_markers_v1";
+const LS_ZONES_KEY = "cca_obs_zones_v2";
+const LS_MARKERS_KEY = "cca_obs_markers_v2";
 
 /* =======================
    TYPES & CONSTANTS
@@ -77,8 +77,8 @@ type Marker = {
   activity: ActivityType;
   isGroup: boolean;
 
-  x: number;
-  y: number;
+  x: number; // 0..1
+  y: number; // 0..1
 
   zone: string;
   note: string;
@@ -122,11 +122,9 @@ function csvEscape(value: string) {
   if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
   return v;
 }
-
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
 }
-
 function rectNormalize(a: { x: number; y: number }, b: { x: number; y: number }) {
   const x1 = Math.min(a.x, b.x);
   const y1 = Math.min(a.y, b.y);
@@ -179,21 +177,72 @@ function parseCSV(text: string): string[][] {
 
 /* =======================
    CLOUD WRITE (Sheets)
-   - no-cors + text/plain avoids CORS/preflight
 ======================= */
 
 async function sendToSheets(payload: Record<string, any>) {
   if (!SHEETS_WEBHOOK_URL) throw new Error("Sheets webhook URL missing.");
-
   await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload),
   });
-
-  // no-cors: we can't read response; resolved fetch means "sent".
   return true;
+}
+
+/* =======================
+   ZONES
+======================= */
+
+function zoneForPointFromZones(x: number, y: number, zones: ZoneRect[]): string {
+  for (const z of zones) if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
+  return "Unassigned";
+}
+
+function zoneColorByIndex(i: number) {
+  // Soft, readable fills (cycled)
+  const palette = [
+    "rgba(59,130,246,0.14)", // blue
+    "rgba(16,185,129,0.14)", // green
+    "rgba(245,158,11,0.16)", // amber
+    "rgba(236,72,153,0.14)", // pink
+    "rgba(168,85,247,0.14)", // purple
+    "rgba(14,165,233,0.14)", // cyan
+    "rgba(239,68,68,0.12)",  // red
+    "rgba(99,102,241,0.14)", // indigo
+  ];
+  return palette[i % palette.length];
+}
+
+/* =======================
+   HEATMAP (GRID)
+======================= */
+
+type HeatCell = { gx: number; gy: number; count: number; norm: number };
+
+function buildHeatmapGrid(points: { x: number; y: number }[], grid: number): HeatCell[] {
+  const g = Math.max(5, Math.min(200, Math.floor(grid)));
+  const counts = new Map<number, number>();
+
+  for (const p of points) {
+    const gx = Math.max(0, Math.min(g - 1, Math.floor(p.x * g)));
+    const gy = Math.max(0, Math.min(g - 1, Math.floor(p.y * g)));
+    const key = gy * g + gx;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  let max = 0;
+  for (const v of counts.values()) max = Math.max(max, v);
+
+  const cells: HeatCell[] = [];
+  for (const [key, count] of counts.entries()) {
+    const gy = Math.floor(key / g);
+    const gx = key % g;
+    const norm = max > 0 ? count / max : 0;
+    cells.push({ gx, gy, count, norm });
+  }
+
+  return cells;
 }
 
 /* =======================
@@ -253,17 +302,9 @@ const styles = {
 
 type Tab = "collect" | "review";
 
-function zoneForPointFromZones(x: number, y: number, zones: ZoneRect[]): string {
-  for (const z of zones) {
-    if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
-  }
-  return "Unassigned";
-}
-
 export default function Page() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // bottom tabs
   const [tab, setTab] = useState<Tab>("collect");
 
   // Session settings
@@ -293,12 +334,12 @@ export default function Page() {
   // Zones
   const [zones, setZones] = useState<ZoneRect[]>([]);
 
-  // Autosend queue
+  // Auto-send
   const [autoSendEnabled, setAutoSendEnabled] = useState(true);
   const [sendLoopStatus, setSendLoopStatus] = useState<"idle" | "sending" | "ok" | "fail">("idle");
   const [lastSendAt, setLastSendAt] = useState<number | null>(null);
 
-  // Review tools: CSV import/playback/filters
+  // Review tools
   const [importMode, setImportMode] = useState<"replace" | "append">("replace");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -314,14 +355,19 @@ export default function Page() {
   const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2 | 4 | 8>(2);
   const [playbackPos, setPlaybackPos] = useState(1000);
 
-  // Zone editor mode (Review tab)
+  // Zone editor
   const [zoneEditorOn, setZoneEditorOn] = useState(false);
   const [zoneDraftName, setZoneDraftName] = useState("New Zone");
   const [isDrawingZone, setIsDrawingZone] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [dragNow, setDragNow] = useState<{ x: number; y: number } | null>(null);
 
-  // ---- Load persisted zones + markers
+  // Heatmap controls (Review)
+  const [heatmapOn, setHeatmapOn] = useState(false);
+  const [heatGrid, setHeatGrid] = useState(60);
+  const [heatStrength, setHeatStrength] = useState(0.55); // opacity multiplier 0..1
+
+  // Load persisted zones + markers
   useEffect(() => {
     try {
       const rawZ = localStorage.getItem(LS_ZONES_KEY);
@@ -339,7 +385,7 @@ export default function Page() {
     } catch {}
   }, []);
 
-  // ---- Persist zones + markers
+  // Persist zones + markers
   useEffect(() => {
     try {
       localStorage.setItem(LS_ZONES_KEY, JSON.stringify(zones));
@@ -360,7 +406,6 @@ export default function Page() {
   // Timer tick
   useEffect(() => {
     if (!isRunning || intervalStart === null) return;
-
     const id = setInterval(() => {
       const elapsed = Math.floor((Date.now() - intervalStart) / 1000);
       if (elapsed >= intervalSeconds) {
@@ -371,7 +416,6 @@ export default function Page() {
         setTimeLeft(intervalSeconds - elapsed);
       }
     }, 250);
-
     return () => clearInterval(id);
   }, [isRunning, intervalStart, intervalSeconds]);
 
@@ -391,9 +435,10 @@ export default function Page() {
     [activity]
   );
 
-  // Sorted markers for playback
+  // Sorted markers
   const markersSorted = useMemo(() => [...markers].sort((a, b) => a.createdAt - b.createdAt), [markers]);
 
+  // Playback window
   const playbackWindow = useMemo(() => {
     if (markersSorted.length === 0) return null;
     return { minT: markersSorted[0].createdAt, maxT: markersSorted[markersSorted.length - 1].createdAt };
@@ -434,12 +479,15 @@ export default function Page() {
     setIsPlaying(false);
   }, [playbackEnabled]);
 
-  // Autosend loop: every ~1s, try to send ONE pending/fail marker
+  // Auto-send loop (1 per second)
   useEffect(() => {
     if (!autoSendEnabled) return;
 
     const id = window.setInterval(async () => {
-      const candidate = markersSorted.find((m) => m.source !== "import" && (m.cloudStatus === "pending" || m.cloudStatus === "fail"));
+      const candidate = markersSorted.find(
+        (m) => (m.source ?? "live") !== "import" && (m.cloudStatus === "pending" || m.cloudStatus === "fail")
+      );
+
       if (!candidate) {
         setSendLoopStatus("idle");
         return;
@@ -470,6 +518,7 @@ export default function Page() {
           if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "ok" };
           return copy;
         });
+
         setSendLoopStatus("ok");
         setLastSendAt(Date.now());
       } catch {
@@ -484,8 +533,7 @@ export default function Page() {
     }, 1000);
 
     return () => window.clearInterval(id);
-    // NOTE: markersSorted changes often, but that's ok; we want latest list.
-  }, [autoSendEnabled, markersSorted, intervalMinutes, intervalMinutes, intervalSeconds]);
+  }, [autoSendEnabled, markersSorted, intervalMinutes]);
 
   // Controls
   function start() {
@@ -653,16 +701,9 @@ export default function Page() {
     }
   }
 
-  async function handleClick(e: React.MouseEvent) {
+  // Main click handler (collect)
+  function handleCollectClick(e: React.MouseEvent) {
     setStatusMsg("");
-
-    // If zone editor is ON (in Review), drawing rectangles
-    if (tab === "review" && zoneEditorOn) {
-      if (!isDrawingZone) return;
-      return;
-    }
-
-    if (tab !== "collect") return;
     if (!isRunning || intervalStart === null) return setStatusMsg("Press Start to begin recording.");
     if (!badgeNumber.trim()) return setStatusMsg("Enter a badge number before recording.");
 
@@ -733,9 +774,7 @@ export default function Page() {
     const byActivity = new Map<ActivityType, number>();
     for (const a of ACTIVITY) byActivity.set(a.key, 0);
     for (const m of reviewMarkers) byActivity.set(m.activity, (byActivity.get(m.activity) || 0) + 1);
-    const live = reviewMarkers.filter((m) => (m.source ?? "live") === "live").length;
-    const imp = reviewMarkers.filter((m) => m.source === "import").length;
-    return { byActivity, live, imp, total: reviewMarkers.length };
+    return { byActivity, total: reviewMarkers.length };
   }, [reviewMarkers]);
 
   function clearFilters() {
@@ -745,20 +784,14 @@ export default function Page() {
     setFilterGroupOnly(false);
   }
 
-  // Dot rendering: Collect shows ALL markers; Review shows reviewMarkers
-  const markersToRender = tab === "collect" ? markersSorted : reviewMarkers;
+  // Heatmap computed from reviewMarkers (after filters + playback)
+  const heatCells = useMemo(() => {
+    if (!(tab === "review" && heatmapOn)) return [];
+    const pts = reviewMarkers.map((m) => ({ x: m.x, y: m.y }));
+    return buildHeatmapGrid(pts, heatGrid);
+  }, [tab, heatmapOn, heatGrid, reviewMarkers]);
 
-  function cloudBadgeText() {
-    if (!autoSendEnabled) return "Auto-send: OFF";
-    if (sendLoopStatus === "sending") return "Auto-send: sending…";
-    if (sendLoopStatus === "ok") return "Auto-send: OK";
-    if (sendLoopStatus === "fail") return "Auto-send: FAIL (retrying)";
-    return "Auto-send: idle";
-  }
-
-  // =======================
-  // Zone drawing handlers
-  // =======================
+  // Zone drawing helpers
   function planPointFromEvent(e: React.MouseEvent) {
     const el = containerRef.current;
     if (!el) return null;
@@ -793,7 +826,7 @@ export default function Page() {
     }
 
     const r = rectNormalize(dragStart, dragNow);
-    const minSize = 0.01; // avoid accidental tiny zones
+    const minSize = 0.01;
     if (r.x2 - r.x1 < minSize || r.y2 - r.y1 < minSize) {
       setIsDrawingZone(false);
       setDragStart(null);
@@ -821,10 +854,6 @@ export default function Page() {
     setZones((prev) => prev.filter((z) => z.id !== id));
   }
 
-  // ===================================
-  // Update zones for existing markers?
-  // (Optional helper button)
-  // ===================================
   function recomputeZonesForAllMarkers() {
     setMarkers((prev) =>
       prev.map((m) => ({
@@ -834,6 +863,22 @@ export default function Page() {
     );
     setStatusMsg("Recomputed zones for all markers using current zone rectangles.");
   }
+
+  function cloudBadgeText() {
+    if (!autoSendEnabled) return "Auto-send: OFF";
+    if (sendLoopStatus === "sending") return "Auto-send: sending…";
+    if (sendLoopStatus === "ok") return "Auto-send: OK";
+    if (sendLoopStatus === "fail") return "Auto-send: FAIL (retrying)";
+    return "Auto-send: idle";
+  }
+
+  // Dots: Collect shows all; Review shows reviewMarkers
+  const markersToRender = tab === "collect" ? markersSorted : reviewMarkers;
+
+  // Zone overlay toggles (Review)
+  const [showZonesFill, setShowZonesFill] = useState(true);
+  const [showZonesOutline, setShowZonesOutline] = useState(true);
+  const [showZoneLabels, setShowZoneLabels] = useState(false);
 
   return (
     <div style={{ background: "#fff", minHeight: "100vh", color: "#111", paddingBottom: 84 }}>
@@ -857,9 +902,7 @@ export default function Page() {
           <span style={styles.pill}>Tab: {tab === "collect" ? "Collect" : "Review"}</span>
           <span style={styles.pill}>Markers: {markers.length}</span>
           <span style={styles.pill}>{cloudBadgeText()}</span>
-          {lastSendAt ? (
-            <span style={styles.pill}>Last send: {formatHMS(new Date(lastSendAt))}</span>
-          ) : null}
+          {lastSendAt ? <span style={styles.pill}>Last send: {formatHMS(new Date(lastSendAt))}</span> : null}
         </div>
       </header>
 
@@ -875,7 +918,6 @@ export default function Page() {
               boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
             }}
           >
-            {/* Session + Start/Pause + Export + Autosend toggle */}
             <div
               style={{
                 display: "grid",
@@ -886,11 +928,7 @@ export default function Page() {
             >
               <div>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Observer</div>
-                <select
-                  style={styles.select}
-                  value={observerName}
-                  onChange={(e) => setObserverName(e.target.value)}
-                >
+                <select style={styles.select} value={observerName} onChange={(e) => setObserverName(e.target.value)}>
                   <option>Observer 1</option>
                   <option>Observer 2</option>
                   <option>Observer 3</option>
@@ -899,11 +937,7 @@ export default function Page() {
 
               <div>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Site</div>
-                <select
-                  style={styles.select}
-                  value={buildingSite}
-                  onChange={(e) => setBuildingSite(e.target.value)}
-                >
+                <select style={styles.select} value={buildingSite} onChange={(e) => setBuildingSite(e.target.value)}>
                   <option>Habitat A</option>
                   <option>Habitat B</option>
                   <option>Control Room</option>
@@ -951,7 +985,6 @@ export default function Page() {
               </div>
             </div>
 
-            {/* Per-person fields */}
             <div
               style={{
                 display: "grid",
@@ -962,9 +995,7 @@ export default function Page() {
               }}
             >
               <div>
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                  Badge number (shadowed person)
-                </div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Badge number (shadowed person)</div>
                 <input
                   style={styles.input}
                   value={badgeNumber}
@@ -975,11 +1006,7 @@ export default function Page() {
 
               <div>
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
-                <select
-                  style={styles.select}
-                  value={role}
-                  onChange={(e) => setRole(e.target.value as RoleType)}
-                >
+                <select style={styles.select} value={role} onChange={(e) => setRole(e.target.value as RoleType)}>
                   {ROLES.map((r) => (
                     <option key={r.key} value={r.key}>
                       {r.label}
@@ -999,16 +1026,11 @@ export default function Page() {
               </div>
 
               <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
-                <input
-                  type="checkbox"
-                  checked={isGroup}
-                  onChange={(e) => setIsGroup(e.target.checked)}
-                />
+                <input type="checkbox" checked={isGroup} onChange={(e) => setIsGroup(e.target.checked)} />
                 Group
               </label>
             </div>
 
-            {/* Activity buttons */}
             <div style={{ marginTop: 12 }}>
               <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>Activity</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1047,11 +1069,10 @@ export default function Page() {
               </div>
             </div>
 
-            {/* Status line */}
             <div style={{ marginTop: 12, fontSize: 13 }}>
               <span style={{ fontWeight: 900 }}>
-                Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This
-                interval: {thisIntervalCount}
+                Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This interval:{" "}
+                {thisIntervalCount}
               </span>
               {statusMsg ? (
                 <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 900 }}>
@@ -1075,7 +1096,6 @@ export default function Page() {
                 boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
               }}
             >
-              {/* Import + playback + filters */}
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <button style={styles.buttonSecondary} onClick={exportCSV} disabled={!markers.length}>
@@ -1125,7 +1145,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ fontSize: 12, opacity: 0.85 }}>
-                  Tip: turn on <b>Zone editor</b> and drag rectangles on the plan.
+                  Heatmap + zones are based on filtered markers (and playback if enabled).
                 </div>
               </div>
 
@@ -1237,11 +1257,7 @@ export default function Page() {
 
                   <div>
                     <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
-                    <select
-                      style={styles.select}
-                      value={filterRole}
-                      onChange={(e) => setFilterRole(e.target.value as any)}
-                    >
+                    <select style={styles.select} value={filterRole} onChange={(e) => setFilterRole(e.target.value as any)}>
                       <option value="all">All roles</option>
                       {ROLES.map((r) => (
                         <option key={r.key} value={r.key}>
@@ -1268,11 +1284,7 @@ export default function Page() {
                   </div>
 
                   <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
-                    <input
-                      type="checkbox"
-                      checked={filterGroupOnly}
-                      onChange={(e) => setFilterGroupOnly(e.target.checked)}
-                    />
+                    <input type="checkbox" checked={filterGroupOnly} onChange={(e) => setFilterGroupOnly(e.target.checked)} />
                     Group only
                   </label>
                 </div>
@@ -1281,6 +1293,84 @@ export default function Page() {
                   <span style={styles.pill}>Showing: {reviewMarkers.length}</span>
                   <span style={styles.pill}>Total stored: {markers.length}</span>
                   <span style={styles.pill}>Zones: {zones.length}</span>
+                </div>
+              </div>
+
+              {/* Heatmap + zone overlay controls */}
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #eef2f7" }}>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor: heatmapOn ? "#111" : "#d0d5dd",
+                      background: heatmapOn ? "#111" : "#fff",
+                      color: heatmapOn ? "#fff" : "#111",
+                    }}
+                    onClick={() => setHeatmapOn((v) => !v)}
+                  >
+                    Heatmap {heatmapOn ? "ON" : "OFF"}
+                  </button>
+
+                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ opacity: 0.75 }}>Grid</span>
+                    <input
+                      type="range"
+                      min={20}
+                      max={120}
+                      value={heatGrid}
+                      onChange={(e) => setHeatGrid(Number(e.target.value))}
+                    />
+                    <span style={{ width: 34, textAlign: "right" }}>{heatGrid}</span>
+                  </label>
+
+                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ opacity: 0.75 }}>Strength</span>
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={1}
+                      step={0.05}
+                      value={heatStrength}
+                      onChange={(e) => setHeatStrength(Number(e.target.value))}
+                    />
+                    <span style={{ width: 42, textAlign: "right" }}>{heatStrength.toFixed(2)}</span>
+                  </label>
+
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor: showZonesFill ? "#111" : "#d0d5dd",
+                      background: showZonesFill ? "#111" : "#fff",
+                      color: showZonesFill ? "#fff" : "#111",
+                    }}
+                    onClick={() => setShowZonesFill((v) => !v)}
+                  >
+                    Zones fill {showZonesFill ? "ON" : "OFF"}
+                  </button>
+
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor: showZonesOutline ? "#111" : "#d0d5dd",
+                      background: showZonesOutline ? "#111" : "#fff",
+                      color: showZonesOutline ? "#fff" : "#111",
+                    }}
+                    onClick={() => setShowZonesOutline((v) => !v)}
+                  >
+                    Zone outline {showZonesOutline ? "ON" : "OFF"}
+                  </button>
+
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor: showZoneLabels ? "#111" : "#d0d5dd",
+                      background: showZoneLabels ? "#111" : "#fff",
+                      color: showZoneLabels ? "#fff" : "#111",
+                    }}
+                    onClick={() => setShowZoneLabels((v) => !v)}
+                  >
+                    Labels {showZoneLabels ? "ON" : "OFF"}
+                  </button>
                 </div>
               </div>
 
@@ -1315,9 +1405,7 @@ export default function Page() {
                     />
                   </div>
 
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>
-                    When ON: drag on the plan to create a rectangle zone (saved locally).
-                  </span>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>When ON: drag on the plan to create zone rectangles.</span>
                 </div>
 
                 {zones.length > 0 && (
@@ -1327,7 +1415,7 @@ export default function Page() {
                       {zones
                         .slice()
                         .sort((a, b) => b.createdAt - a.createdAt)
-                        .map((z) => (
+                        .map((z, idx) => (
                           <div
                             key={z.id}
                             style={{
@@ -1338,14 +1426,27 @@ export default function Page() {
                               borderRadius: 10,
                               padding: "8px 10px",
                               fontSize: 12,
+                              gap: 10,
                             }}
                           >
-                            <div>
-                              <b>{z.name}</b>{" "}
-                              <span style={{ opacity: 0.7 }}>
-                                ({z.x1.toFixed(3)},{z.y1.toFixed(3)})–({z.x2.toFixed(3)},{z.y2.toFixed(3)})
-                              </span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                              <span
+                                style={{
+                                  width: 12,
+                                  height: 12,
+                                  borderRadius: 4,
+                                  background: zoneColorByIndex(idx),
+                                  border: "1px solid rgba(0,0,0,0.25)",
+                                }}
+                              />
+                              <div>
+                                <b>{z.name}</b>{" "}
+                                <span style={{ opacity: 0.7 }}>
+                                  ({z.x1.toFixed(3)},{z.y1.toFixed(3)})–({z.x2.toFixed(3)},{z.y2.toFixed(3)})
+                                </span>
+                              </div>
                             </div>
+
                             <button style={styles.buttonSecondary} onClick={() => deleteZone(z.id)}>
                               Delete
                             </button>
@@ -1395,7 +1496,10 @@ export default function Page() {
                   <b>Dot ring</b>: green = cloud ok, red = cloud fail, white = pending
                 </span>
                 <span>
-                  <b>Zones</b>: rectangles drawn in Zone editor; marker zone computed at record time (or Recompute).
+                  <b>Heatmap</b>: grid-based density from filtered markers (strength & grid adjustable)
+                </span>
+                <span>
+                  <b>Zones</b>: colored rectangles (fill + outline toggles)
                 </span>
               </div>
             </div>
@@ -1429,10 +1533,12 @@ export default function Page() {
 
           <div
             ref={containerRef}
-            onClick={handleClick}
-            onMouseDown={onPlanMouseDown}
-            onMouseMove={onPlanMouseMove}
-            onMouseUp={onPlanMouseUp}
+            onClick={(e) => {
+              if (tab === "collect") handleCollectClick(e);
+            }}
+            onMouseDown={tab === "review" && zoneEditorOn ? onPlanMouseDown : undefined}
+            onMouseMove={tab === "review" && zoneEditorOn ? onPlanMouseMove : undefined}
+            onMouseUp={tab === "review" && zoneEditorOn ? onPlanMouseUp : undefined}
             style={{
               position: "relative",
               height: "72vh",
@@ -1447,6 +1553,7 @@ export default function Page() {
               userSelect: "none",
             }}
           >
+            {/* PLAN IMAGE */}
             <img
               src="/plan.png"
               alt="Floorplan"
@@ -1461,26 +1568,81 @@ export default function Page() {
               }}
             />
 
-            {/* Zone rectangles overlay */}
-            {zones.map((z) => (
-              <div
-                key={z.id}
-                title={`Zone: ${z.name}`}
-                style={{
-                  position: "absolute",
-                  left: `${z.x1 * 100}%`,
-                  top: `${z.y1 * 100}%`,
-                  width: `${(z.x2 - z.x1) * 100}%`,
-                  height: `${(z.y2 - z.y1) * 100}%`,
-                  border: "2px solid rgba(0,0,0,0.35)",
-                  background: "rgba(0,0,0,0.03)",
-                  zIndex: 3,
-                  pointerEvents: "none",
-                }}
-              />
-            ))}
+            {/* HEATMAP (Review only) */}
+            {tab === "review" && heatmapOn ? (
+              <div style={{ position: "absolute", inset: 0, zIndex: 2, pointerEvents: "none" }}>
+                {heatCells.map((c) => {
+                  const g = Math.max(5, Math.min(200, Math.floor(heatGrid)));
+                  const cellW = 100 / g;
+                  const cellH = 100 / g;
 
-            {/* Draft rectangle while drawing */}
+                  // opacity from density; boosted slightly for visibility
+                  const alpha = clamp01(c.norm * heatStrength);
+
+                  return (
+                    <div
+                      key={`${c.gx}-${c.gy}`}
+                      title={`Heat cell count: ${c.count}`}
+                      style={{
+                        position: "absolute",
+                        left: `${c.gx * cellW}%`,
+                        top: `${c.gy * cellH}%`,
+                        width: `${cellW}%`,
+                        height: `${cellH}%`,
+                        background: `rgba(255, 0, 0, ${alpha})`,
+                        // For a slightly softer look:
+                        filter: "blur(0.2px)",
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {/* ZONE OVERLAYS (Review only) */}
+            {tab === "review" && (showZonesFill || showZonesOutline || showZoneLabels) ? (
+              <div style={{ position: "absolute", inset: 0, zIndex: 3, pointerEvents: "none" }}>
+                {zones.map((z, idx) => {
+                  const fill = zoneColorByIndex(idx);
+                  const outline = "rgba(0,0,0,0.35)";
+                  return (
+                    <div
+                      key={z.id}
+                      title={`Zone: ${z.name}`}
+                      style={{
+                        position: "absolute",
+                        left: `${z.x1 * 100}%`,
+                        top: `${z.y1 * 100}%`,
+                        width: `${(z.x2 - z.x1) * 100}%`,
+                        height: `${(z.y2 - z.y1) * 100}%`,
+                        background: showZonesFill ? fill : "transparent",
+                        border: showZonesOutline ? `2px solid ${outline}` : "none",
+                      }}
+                    >
+                      {showZoneLabels ? (
+                        <div
+                          style={{
+                            position: "absolute",
+                            left: 6,
+                            top: 6,
+                            fontSize: 12,
+                            fontWeight: 900,
+                            padding: "4px 6px",
+                            borderRadius: 8,
+                            background: "rgba(255,255,255,0.85)",
+                            border: "1px solid rgba(0,0,0,0.15)",
+                          }}
+                        >
+                          {z.name}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {/* Draft rectangle while drawing zones */}
             {tab === "review" && zoneEditorOn && isDrawingZone && dragStart && dragNow ? (
               (() => {
                 const r = rectNormalize(dragStart, dragNow);
@@ -1492,7 +1654,7 @@ export default function Page() {
                       top: `${r.y1 * 100}%`,
                       width: `${(r.x2 - r.x1) * 100}%`,
                       height: `${(r.y2 - r.y1) * 100}%`,
-                      border: "2px dashed rgba(17,17,17,0.65)",
+                      border: "2px dashed rgba(17,17,17,0.7)",
                       background: "rgba(17,17,17,0.06)",
                       zIndex: 4,
                       pointerEvents: "none",
@@ -1502,54 +1664,55 @@ export default function Page() {
               })()
             ) : null}
 
-            {/* Markers */}
-            {markersToRender.map((m) => {
-              const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
-              const ring =
-                m.cloudStatus === "ok"
-                  ? "2px solid rgba(34,197,94,0.9)"
-                  : m.cloudStatus === "fail"
-                  ? "2px solid rgba(239,68,68,0.95)"
-                  : "2px solid rgba(255,255,255,0.95)";
-              const isImport = (m.source ?? "live") === "import";
+            {/* MARKERS */}
+            <div style={{ position: "absolute", inset: 0, zIndex: 6, pointerEvents: "none" }}>
+              {markersToRender.map((m) => {
+                const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
+                const ring =
+                  m.cloudStatus === "ok"
+                    ? "2px solid rgba(34,197,94,0.9)"
+                    : m.cloudStatus === "fail"
+                    ? "2px solid rgba(239,68,68,0.95)"
+                    : "2px solid rgba(255,255,255,0.95)";
+                const isImport = (m.source ?? "live") === "import";
 
-              return (
-                <div
-                  key={m.id}
-                  title={[
-                    `Time: ${formatHMS(new Date(m.createdAt))}`,
-                    `Badge: ${m.badgeNumber}`,
-                    `Role: ${m.role}`,
-                    `Activity: ${m.activity}`,
-                    `Zone: ${m.zone}`,
-                    `Interval: ${m.intervalLabel}`,
-                    `Cloud: ${m.cloudStatus ?? "pending"}`,
-                    m.note ? `Note: ${m.note}` : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                  style={{
-                    position: "absolute",
-                    left: `${m.x * 100}%`,
-                    top: `${m.y * 100}%`,
-                    transform: "translate(-50%, -50%)",
-                    width: 14,
-                    height: 14,
-                    borderRadius: 999,
-                    background: color,
-                    border: ring,
-                    outline: isImport ? "2px dashed rgba(0,0,0,0.35)" : "none",
-                    boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
-                    zIndex: 6,
-                  }}
-                />
-              );
-            })}
+                return (
+                  <div
+                    key={m.id}
+                    title={[
+                      `Time: ${formatHMS(new Date(m.createdAt))}`,
+                      `Badge: ${m.badgeNumber}`,
+                      `Role: ${m.role}`,
+                      `Activity: ${m.activity}`,
+                      `Zone: ${m.zone}`,
+                      `Interval: ${m.intervalLabel}`,
+                      `Cloud: ${m.cloudStatus ?? "pending"}`,
+                      m.note ? `Note: ${m.note}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                    style={{
+                      position: "absolute",
+                      left: `${m.x * 100}%`,
+                      top: `${m.y * 100}%`,
+                      transform: "translate(-50%, -50%)",
+                      width: 14,
+                      height: 14,
+                      borderRadius: 999,
+                      background: color,
+                      border: ring,
+                      outline: isImport ? "2px dashed rgba(0,0,0,0.35)" : "none",
+                      boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
+                    }}
+                  />
+                );
+              })}
+            </div>
           </div>
         </div>
 
         <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-          Zones are saved locally in your browser. If you open the app on a different device/browser, re-draw them (or we can add import/export zones next).
+          Heatmap uses the <b>filtered markers</b> (and playback cutoff, if enabled). Zones are rectangles drawn on the plan (saved locally).
         </div>
       </div>
 
