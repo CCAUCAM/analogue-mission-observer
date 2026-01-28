@@ -4,7 +4,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /* =======================
    GOOGLE SHEETS (NO AUTH)
-   - Using no-cors to avoid browser CORS blocking with Apps Script
 ======================= */
 
 const SHEETS_WEBHOOK_URL =
@@ -58,7 +57,7 @@ const ROLES: { key: RoleType; label: string }[] = [
 
 type Marker = {
   id: string;
-  createdAt: number; // ms
+  createdAt: number;
   intervalIndex: number;
   intervalLabel: string;
 
@@ -71,30 +70,20 @@ type Marker = {
   activity: ActivityType;
   isGroup: boolean;
 
-  x: number; // 0..1
-  y: number; // 0..1
+  x: number;
+  y: number;
 
-  zone: string; // derived
+  zone: string;
   note: string;
 
-  // cloud write status for UI feedback
   cloudStatus?: "pending" | "ok" | "fail";
 };
 
 /* =======================
    ZONES (EDIT THESE)
-   - Coordinates are NORMALIZED (0..1)
-   - x1,y1 is top-left; x2,y2 bottom-right
-   - Order matters: first match wins
 ======================= */
 
-type ZoneRect = {
-  name: string;
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-};
+type ZoneRect = { name: string; x1: number; y1: number; x2: number; y2: number };
 
 const ZONES: ZoneRect[] = [
   { name: "Atrium/Operations", x1: 0.34, y1: 0.30, x2: 0.56, y2: 0.64 },
@@ -108,9 +97,7 @@ const ZONES: ZoneRect[] = [
 ];
 
 function zoneForPoint(x: number, y: number): string {
-  for (const z of ZONES) {
-    if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
-  }
+  for (const z of ZONES) if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
   return "Unassigned";
 }
 
@@ -121,20 +108,16 @@ function zoneForPoint(x: number, y: number): string {
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
-
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
-
 function formatHM(d: Date) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
-
 function formatIntervalLabel(start: Date, durationSeconds: number) {
   const end = new Date(start.getTime() + durationSeconds * 1000);
   return `${formatHM(start)}–${formatHM(end)}`;
 }
-
 function csvEscape(value: string) {
   const v = value ?? "";
   if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
@@ -185,19 +168,23 @@ const styles = {
 };
 
 /* =======================
-   CLOUD WRITE (Sheets, no-cors)
+   CLOUD WRITE (Sheets)
+   - no-cors + text/plain avoids CORS/preflight
 ======================= */
 
 async function sendToSheets(payload: Record<string, any>) {
-  if (!SHEETS_WEBHOOK_URL) return;
+  if (!SHEETS_WEBHOOK_URL) throw new Error("Sheets webhook URL missing.");
 
-  // no-cors avoids browser CORS/preflight problems with Apps Script
-  // Tradeoff: we can't read/verify the response. Good for "no protection" pilot mode.
   await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     mode: "no-cors",
+    // text/plain avoids preflight; Apps Script still receives e.postData.contents
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload),
   });
+
+  // In no-cors mode we cannot read the response. If fetch resolves, it was sent.
+  return true;
 }
 
 /* =======================
@@ -227,6 +214,12 @@ export default function Page() {
   const [markers, setMarkers] = useState<Marker[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>("");
   const [lastRecorded, setLastRecorded] = useState<string>("");
+
+  // TEST status
+  const [testStatus, setTestStatus] = useState<
+    "idle" | "sending" | "sent" | "failed"
+  >("idle");
+  const [testHint, setTestHint] = useState<string>("");
 
   // Keep timeLeft synced when not running
   useEffect(() => {
@@ -346,6 +339,43 @@ export default function Page() {
     a.click();
   }
 
+  async function sendTestRow() {
+    setTestStatus("sending");
+    setTestHint("");
+
+    try {
+      const payload = {
+        created_at_iso: new Date().toISOString(),
+        observer: observerName,
+        site: buildingSite,
+        interval_minutes: intervalMinutes,
+        interval_index: intervalIndex,
+        interval_label: intervalLabel,
+        badge: "TEST",
+        role: role,
+        activity: activity,
+        group: false,
+        x_norm: 0.5,
+        y_norm: 0.5,
+        zone: "TEST",
+        note: "TEST ROW — sent from app",
+      };
+
+      await sendToSheets(payload);
+
+      setTestStatus("sent");
+      setTestHint("Sent ✓ Now check the Google Sheet (tab: observations).");
+
+      // auto-reset indicator after a moment
+      window.setTimeout(() => setTestStatus("idle"), 3500);
+    } catch (err: any) {
+      setTestStatus("failed");
+      setTestHint(
+        "Failed. Likely Apps Script deployment settings. See notes below."
+      );
+    }
+  }
+
   async function handleClick(e: React.MouseEvent) {
     setStatusMsg("");
 
@@ -389,12 +419,10 @@ export default function Page() {
     // Optimistic UI
     setMarkers((prev) => [...prev, base]);
     setLastRecorded(
-      `Recorded: badge ${base.badgeNumber} · ${
-        ROLES.find((r) => r.key === base.role)?.label
-      } · ${selectedActivityMeta.label} · ${base.zone}`
+      `Recorded: badge ${base.badgeNumber} · ${ROLES.find((r) => r.key === base.role)?.label} · ${selectedActivityMeta.label} · ${base.zone}`
     );
 
-    // Send to Sheets (no-cors). If network fails, we can catch that.
+    // Send to Sheets: if network-level error occurs, mark fail
     sendToSheets({
       created_at_iso: new Date(base.createdAt).toISOString(),
       observer: base.observerName,
@@ -434,6 +462,15 @@ export default function Page() {
     () => markers.filter((m) => m.intervalIndex === intervalIndex).length,
     [markers, intervalIndex]
   );
+
+  const testButtonLabel =
+    testStatus === "sending"
+      ? "Sending…"
+      : testStatus === "sent"
+      ? "Sent ✓"
+      : testStatus === "failed"
+      ? "Failed ✕"
+      : "Send TEST row";
 
   return (
     <div style={{ background: "#fff", minHeight: "100vh", color: "#111" }}>
@@ -516,7 +553,7 @@ export default function Page() {
               />
             </div>
 
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
               <button style={styles.buttonPrimary} onClick={start}>
                 Start
               </button>
@@ -537,7 +574,33 @@ export default function Page() {
               >
                 Export CSV
               </button>
+              <button
+                style={{
+                  ...styles.buttonSecondary,
+                  borderColor:
+                    testStatus === "failed"
+                      ? "#ef4444"
+                      : testStatus === "sent"
+                      ? "#22c55e"
+                      : "#d0d5dd",
+                }}
+                onClick={sendTestRow}
+                disabled={testStatus === "sending"}
+              >
+                {testButtonLabel}
+              </button>
             </div>
+          </div>
+
+          {/* TEST hint */}
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
+            {testHint ? (
+              <span>{testHint}</span>
+            ) : (
+              <span>
+                Cloud test: sends a row with badge <b>TEST</b> to the Google Sheet.
+              </span>
+            )}
           </div>
 
           {/* Row 2 */}
@@ -651,7 +714,8 @@ export default function Page() {
               <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div>
             ) : null}
             <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-              Cloud logging: Google Sheets (no-auth).
+              Cloud logging: Google Sheets (no-auth). If TEST doesn’t appear, fix Apps Script deploy:
+              Execute as <b>Me</b>, Access <b>Anyone with the link</b>, then redeploy/update.
             </div>
           </div>
         </div>
