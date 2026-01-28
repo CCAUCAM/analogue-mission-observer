@@ -10,6 +10,13 @@ const SHEETS_WEBHOOK_URL =
   "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
 
 /* =======================
+   STORAGE KEYS
+======================= */
+
+const LS_ZONES_KEY = "cca_obs_zones_v1";
+const LS_MARKERS_KEY = "cca_obs_markers_v1";
+
+/* =======================
    TYPES & CONSTANTS
 ======================= */
 
@@ -80,27 +87,15 @@ type Marker = {
   source?: "live" | "import";
 };
 
-/* =======================
-   ZONES (EDIT THESE)
-======================= */
-
-type ZoneRect = { name: string; x1: number; y1: number; x2: number; y2: number };
-
-const ZONES: ZoneRect[] = [
-  { name: "Atrium/Operations", x1: 0.34, y1: 0.30, x2: 0.56, y2: 0.64 },
-  { name: "Storage/Technical", x1: 0.30, y1: 0.05, x2: 0.52, y2: 0.30 },
-  { name: "Hygiene Module", x1: 0.58, y1: 0.58, x2: 0.96, y2: 0.78 },
-  { name: "Plant Cultivation", x1: 0.58, y1: 0.40, x2: 0.96, y2: 0.58 },
-  { name: "Biological Lab", x1: 0.58, y1: 0.22, x2: 0.96, y2: 0.40 },
-  { name: "Workshops", x1: 0.50, y1: 0.78, x2: 0.96, y2: 0.95 },
-  { name: "Medical Module", x1: 0.05, y1: 0.52, x2: 0.28, y2: 0.72 },
-  { name: "Airlock", x1: 0.18, y1: 0.72, x2: 0.34, y2: 0.90 },
-];
-
-function zoneForPoint(x: number, y: number): string {
-  for (const z of ZONES) if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
-  return "Unassigned";
-}
+type ZoneRect = {
+  id: string;
+  name: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  createdAt: number;
+};
 
 /* =======================
    HELPERS
@@ -126,6 +121,18 @@ function csvEscape(value: string) {
   const v = value ?? "";
   if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
   return v;
+}
+
+function clamp01(n: number) {
+  return Math.max(0, Math.min(1, n));
+}
+
+function rectNormalize(a: { x: number; y: number }, b: { x: number; y: number }) {
+  const x1 = Math.min(a.x, b.x);
+  const y1 = Math.min(a.y, b.y);
+  const x2 = Math.max(a.x, b.x);
+  const y2 = Math.max(a.y, b.y);
+  return { x1, y1, x2, y2 };
 }
 
 function parseCSV(text: string): string[][] {
@@ -172,16 +179,20 @@ function parseCSV(text: string): string[][] {
 
 /* =======================
    CLOUD WRITE (Sheets)
+   - no-cors + text/plain avoids CORS/preflight
 ======================= */
 
 async function sendToSheets(payload: Record<string, any>) {
   if (!SHEETS_WEBHOOK_URL) throw new Error("Sheets webhook URL missing.");
+
   await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload),
   });
+
+  // no-cors: we can't read response; resolved fetch means "sent".
   return true;
 }
 
@@ -242,6 +253,13 @@ const styles = {
 
 type Tab = "collect" | "review";
 
+function zoneForPointFromZones(x: number, y: number, zones: ZoneRect[]): string {
+  for (const z of zones) {
+    if (x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2) return z.name;
+  }
+  return "Unassigned";
+}
+
 export default function Page() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -272,11 +290,15 @@ export default function Page() {
   const [statusMsg, setStatusMsg] = useState<string>("");
   const [lastRecorded, setLastRecorded] = useState<string>("");
 
-  // Review tools
-  const [testStatus, setTestStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
-  const [testHint, setTestHint] = useState<string>("");
+  // Zones
+  const [zones, setZones] = useState<ZoneRect[]>([]);
 
-  // CSV import
+  // Autosend queue
+  const [autoSendEnabled, setAutoSendEnabled] = useState(true);
+  const [sendLoopStatus, setSendLoopStatus] = useState<"idle" | "sending" | "ok" | "fail">("idle");
+  const [lastSendAt, setLastSendAt] = useState<number | null>(null);
+
+  // Review tools: CSV import/playback/filters
   const [importMode, setImportMode] = useState<"replace" | "append">("replace");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -291,6 +313,44 @@ export default function Page() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2 | 4 | 8>(2);
   const [playbackPos, setPlaybackPos] = useState(1000);
+
+  // Zone editor mode (Review tab)
+  const [zoneEditorOn, setZoneEditorOn] = useState(false);
+  const [zoneDraftName, setZoneDraftName] = useState("New Zone");
+  const [isDrawingZone, setIsDrawingZone] = useState(false);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [dragNow, setDragNow] = useState<{ x: number; y: number } | null>(null);
+
+  // ---- Load persisted zones + markers
+  useEffect(() => {
+    try {
+      const rawZ = localStorage.getItem(LS_ZONES_KEY);
+      if (rawZ) {
+        const parsed = JSON.parse(rawZ) as ZoneRect[];
+        if (Array.isArray(parsed)) setZones(parsed);
+      }
+    } catch {}
+    try {
+      const rawM = localStorage.getItem(LS_MARKERS_KEY);
+      if (rawM) {
+        const parsed = JSON.parse(rawM) as Marker[];
+        if (Array.isArray(parsed)) setMarkers(parsed);
+      }
+    } catch {}
+  }, []);
+
+  // ---- Persist zones + markers
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_ZONES_KEY, JSON.stringify(zones));
+    } catch {}
+  }, [zones]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_MARKERS_KEY, JSON.stringify(markers));
+    } catch {}
+  }, [markers]);
 
   // Keep timeLeft synced when not running
   useEffect(() => {
@@ -373,6 +433,59 @@ export default function Page() {
     if (playbackEnabled) setPlaybackPos(1000);
     setIsPlaying(false);
   }, [playbackEnabled]);
+
+  // Autosend loop: every ~1s, try to send ONE pending/fail marker
+  useEffect(() => {
+    if (!autoSendEnabled) return;
+
+    const id = window.setInterval(async () => {
+      const candidate = markersSorted.find((m) => m.source !== "import" && (m.cloudStatus === "pending" || m.cloudStatus === "fail"));
+      if (!candidate) {
+        setSendLoopStatus("idle");
+        return;
+      }
+
+      setSendLoopStatus("sending");
+      try {
+        await sendToSheets({
+          created_at_iso: new Date(candidate.createdAt).toISOString(),
+          observer: candidate.observerName,
+          site: candidate.buildingSite,
+          interval_minutes: intervalMinutes,
+          interval_index: candidate.intervalIndex,
+          interval_label: candidate.intervalLabel,
+          badge: candidate.badgeNumber,
+          role: candidate.role,
+          activity: candidate.activity,
+          group: candidate.isGroup,
+          x_norm: candidate.x,
+          y_norm: candidate.y,
+          zone: candidate.zone,
+          note: candidate.note,
+        });
+
+        setMarkers((prev) => {
+          const copy = [...prev];
+          const i = copy.findIndex((m) => m.id === candidate.id);
+          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "ok" };
+          return copy;
+        });
+        setSendLoopStatus("ok");
+        setLastSendAt(Date.now());
+      } catch {
+        setMarkers((prev) => {
+          const copy = [...prev];
+          const i = copy.findIndex((m) => m.id === candidate.id);
+          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "fail" };
+          return copy;
+        });
+        setSendLoopStatus("fail");
+      }
+    }, 1000);
+
+    return () => window.clearInterval(id);
+    // NOTE: markersSorted changes often, but that's ok; we want latest list.
+  }, [autoSendEnabled, markersSorted, intervalMinutes, intervalMinutes, intervalSeconds]);
 
   // Controls
   function start() {
@@ -457,35 +570,6 @@ export default function Page() {
     a.click();
   }
 
-  async function sendTestRow() {
-    setTestStatus("sending");
-    setTestHint("");
-    try {
-      await sendToSheets({
-        created_at_iso: new Date().toISOString(),
-        observer: observerName,
-        site: buildingSite,
-        interval_minutes: intervalMinutes,
-        interval_index: intervalIndex,
-        interval_label: intervalLabel,
-        badge: "TEST",
-        role,
-        activity,
-        group: false,
-        x_norm: 0.5,
-        y_norm: 0.5,
-        zone: "TEST",
-        note: "TEST ROW — sent from app",
-      });
-      setTestStatus("sent");
-      setTestHint("Sent ✓ Now check the Google Sheet (tab: observations).");
-      window.setTimeout(() => setTestStatus("idle"), 3500);
-    } catch {
-      setTestStatus("failed");
-      setTestHint("Failed. Likely deployment settings or URL mismatch.");
-    }
-  }
-
   function onPickCSV() {
     fileInputRef.current?.click();
   }
@@ -547,9 +631,9 @@ export default function Page() {
           role: safeRole,
           activity: safeActivity,
           isGroup,
-          x: isFinite(x) ? Math.min(1, Math.max(0, x)) : 0,
-          y: isFinite(y) ? Math.min(1, Math.max(0, y)) : 0,
-          zone: r[idx("zone")] || zoneForPoint(x, y),
+          x: clamp01(isFinite(x) ? x : 0),
+          y: clamp01(isFinite(y) ? y : 0),
+          zone: r[idx("zone")] || zoneForPointFromZones(x, y, zones),
           note: r[idx("note")] || "",
           cloudStatus: "ok",
           source: "import",
@@ -572,6 +656,13 @@ export default function Page() {
   async function handleClick(e: React.MouseEvent) {
     setStatusMsg("");
 
+    // If zone editor is ON (in Review), drawing rectangles
+    if (tab === "review" && zoneEditorOn) {
+      if (!isDrawingZone) return;
+      return;
+    }
+
+    if (tab !== "collect") return;
     if (!isRunning || intervalStart === null) return setStatusMsg("Press Start to begin recording.");
     if (!badgeNumber.trim()) return setStatusMsg("Enter a badge number before recording.");
 
@@ -579,10 +670,10 @@ export default function Page() {
     if (!el) return;
 
     const rect = el.getBoundingClientRect();
-    const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-    const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
 
-    const zone = zoneForPoint(x, y);
+    const zone = zoneForPointFromZones(x, y, zones);
 
     const base: Marker = {
       id: uid(),
@@ -599,7 +690,7 @@ export default function Page() {
       y,
       zone,
       note,
-      cloudStatus: "pending",
+      cloudStatus: autoSendEnabled ? "pending" : "fail",
       source: "live",
     };
 
@@ -609,40 +700,6 @@ export default function Page() {
         ACTIVITY.find((a) => a.key === base.activity)?.label
       } · ${base.zone}`
     );
-
-    sendToSheets({
-      created_at_iso: new Date(base.createdAt).toISOString(),
-      observer: base.observerName,
-      site: base.buildingSite,
-      interval_minutes: intervalMinutes,
-      interval_index: base.intervalIndex,
-      interval_label: base.intervalLabel,
-      badge: base.badgeNumber,
-      role: base.role,
-      activity: base.activity,
-      group: base.isGroup,
-      x_norm: base.x,
-      y_norm: base.y,
-      zone: base.zone,
-      note: base.note,
-    })
-      .then(() => {
-        setMarkers((prev) => {
-          const copy = [...prev];
-          const i = copy.findIndex((m) => m.id === base.id);
-          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "ok" };
-          return copy;
-        });
-      })
-      .catch(() => {
-        setMarkers((prev) => {
-          const copy = [...prev];
-          const i = copy.findIndex((m) => m.id === base.id);
-          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "fail" };
-          return copy;
-        });
-        setStatusMsg("Saved locally; cloud may not have received it.");
-      });
   }
 
   // Review pipeline: filters + playback
@@ -688,17 +745,95 @@ export default function Page() {
     setFilterGroupOnly(false);
   }
 
-  const testButtonLabel =
-    testStatus === "sending"
-      ? "Sending…"
-      : testStatus === "sent"
-      ? "Sent ✓"
-      : testStatus === "failed"
-      ? "Failed ✕"
-      : "Send TEST row";
-
   // Dot rendering: Collect shows ALL markers; Review shows reviewMarkers
   const markersToRender = tab === "collect" ? markersSorted : reviewMarkers;
+
+  function cloudBadgeText() {
+    if (!autoSendEnabled) return "Auto-send: OFF";
+    if (sendLoopStatus === "sending") return "Auto-send: sending…";
+    if (sendLoopStatus === "ok") return "Auto-send: OK";
+    if (sendLoopStatus === "fail") return "Auto-send: FAIL (retrying)";
+    return "Auto-send: idle";
+  }
+
+  // =======================
+  // Zone drawing handlers
+  // =======================
+  function planPointFromEvent(e: React.MouseEvent) {
+    const el = containerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
+    return { x, y };
+  }
+
+  function onPlanMouseDown(e: React.MouseEvent) {
+    if (!(tab === "review" && zoneEditorOn)) return;
+    const p = planPointFromEvent(e);
+    if (!p) return;
+    setIsDrawingZone(true);
+    setDragStart(p);
+    setDragNow(p);
+  }
+
+  function onPlanMouseMove(e: React.MouseEvent) {
+    if (!(tab === "review" && zoneEditorOn && isDrawingZone)) return;
+    const p = planPointFromEvent(e);
+    if (!p) return;
+    setDragNow(p);
+  }
+
+  function onPlanMouseUp() {
+    if (!(tab === "review" && zoneEditorOn && isDrawingZone && dragStart && dragNow)) {
+      setIsDrawingZone(false);
+      setDragStart(null);
+      setDragNow(null);
+      return;
+    }
+
+    const r = rectNormalize(dragStart, dragNow);
+    const minSize = 0.01; // avoid accidental tiny zones
+    if (r.x2 - r.x1 < minSize || r.y2 - r.y1 < minSize) {
+      setIsDrawingZone(false);
+      setDragStart(null);
+      setDragNow(null);
+      return;
+    }
+
+    const name = (zoneDraftName || "Zone").trim();
+    const newZone: ZoneRect = {
+      id: uid(),
+      name,
+      x1: r.x1,
+      y1: r.y1,
+      x2: r.x2,
+      y2: r.y2,
+      createdAt: Date.now(),
+    };
+    setZones((prev) => [newZone, ...prev]);
+    setIsDrawingZone(false);
+    setDragStart(null);
+    setDragNow(null);
+  }
+
+  function deleteZone(id: string) {
+    setZones((prev) => prev.filter((z) => z.id !== id));
+  }
+
+  // ===================================
+  // Update zones for existing markers?
+  // (Optional helper button)
+  // ===================================
+  function recomputeZonesForAllMarkers() {
+    setMarkers((prev) =>
+      prev.map((m) => ({
+        ...m,
+        zone: zoneForPointFromZones(m.x, m.y, zones),
+      }))
+    );
+    setStatusMsg("Recomputed zones for all markers using current zone rectangles.");
+  }
 
   return (
     <div style={{ background: "#fff", minHeight: "100vh", color: "#111", paddingBottom: 84 }}>
@@ -718,9 +853,13 @@ export default function Page() {
           <div style={{ fontSize: 12, opacity: 0.7 }}>University of Cambridge</div>
         </div>
 
-        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <span style={styles.pill}>Tab: {tab === "collect" ? "Collect" : "Review"}</span>
           <span style={styles.pill}>Markers: {markers.length}</span>
+          <span style={styles.pill}>{cloudBadgeText()}</span>
+          {lastSendAt ? (
+            <span style={styles.pill}>Last send: {formatHMS(new Date(lastSendAt))}</span>
+          ) : null}
         </div>
       </header>
 
@@ -736,11 +875,11 @@ export default function Page() {
               boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
             }}
           >
-            {/* Session + Start/Pause */}
+            {/* Session + Start/Pause + Export + Autosend toggle */}
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.6fr",
+                gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.8fr",
                 gap: 12,
                 alignItems: "end",
               }}
@@ -791,6 +930,20 @@ export default function Page() {
                 </button>
                 <button style={styles.buttonSecondary} onClick={pauseResume}>
                   {isRunning ? "Pause" : "Resume"}
+                </button>
+                <button style={styles.buttonSecondary} onClick={exportCSV} disabled={!markers.length}>
+                  Export CSV
+                </button>
+                <button
+                  style={{
+                    ...styles.buttonSecondary,
+                    borderColor: autoSendEnabled ? "#111" : "#d0d5dd",
+                    background: autoSendEnabled ? "#111" : "#fff",
+                    color: autoSendEnabled ? "#fff" : "#111",
+                  }}
+                  onClick={() => setAutoSendEnabled((v) => !v)}
+                >
+                  Auto-send {autoSendEnabled ? "ON" : "OFF"}
                 </button>
                 <button style={styles.buttonSecondary} onClick={reset}>
                   Reset
@@ -913,7 +1066,6 @@ export default function Page() {
         {/* ===== REVIEW TAB ===== */}
         {tab === "review" && (
           <>
-            {/* Review controls */}
             <div
               style={{
                 border: "1px solid #e5e7eb",
@@ -923,6 +1075,7 @@ export default function Page() {
                 boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
               }}
             >
+              {/* Import + playback + filters */}
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <button style={styles.buttonSecondary} onClick={exportCSV} disabled={!markers.length}>
@@ -957,107 +1110,86 @@ export default function Page() {
                   </label>
 
                   <button
-                    style={{
-                      ...styles.buttonSecondary,
-                      borderColor:
-                        testStatus === "failed"
-                          ? "#ef4444"
-                          : testStatus === "sent"
-                          ? "#22c55e"
-                          : "#d0d5dd",
+                    style={styles.buttonSecondary}
+                    onClick={() => {
+                      setPlaybackEnabled((v) => !v);
+                      setIsPlaying(false);
                     }}
-                    onClick={sendTestRow}
-                    disabled={testStatus === "sending"}
                   >
-                    {testButtonLabel}
+                    Playback {playbackEnabled ? "ON" : "OFF"}
+                  </button>
+
+                  <button style={styles.buttonSecondary} onClick={recomputeZonesForAllMarkers} disabled={!zones.length}>
+                    Recompute zones
                   </button>
                 </div>
 
                 <div style={{ fontSize: 12, opacity: 0.85 }}>
-                  {testHint ? (
-                    <span>{testHint}</span>
-                  ) : (
-                    <span>
-                      Tip: Use <b>Load CSV</b> to replay previous sessions.
-                    </span>
-                  )}
+                  Tip: turn on <b>Zone editor</b> and drag rectangles on the plan.
                 </div>
               </div>
 
-              {/* Playback */}
-              <div
-                style={{
-                  marginTop: 12,
-                  paddingTop: 12,
-                  borderTop: "1px solid #eef2f7",
-                  display: "flex",
-                  gap: 12,
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                }}
-              >
-                <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
-                  <input
-                    type="checkbox"
-                    checked={playbackEnabled}
-                    onChange={(e) => setPlaybackEnabled(e.target.checked)}
-                  />
-                  Playback
-                </label>
+              {/* Playback row */}
+              {playbackEnabled && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    paddingTop: 12,
+                    borderTop: "1px solid #eef2f7",
+                    display: "flex",
+                    gap: 12,
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => setIsPlaying((p) => !p)}
+                    disabled={markersSorted.length === 0}
+                  >
+                    {isPlaying ? "Pause replay" : "Play replay"}
+                  </button>
 
-                {playbackEnabled && (
-                  <>
-                    <button
-                      style={styles.buttonSecondary}
-                      onClick={() => setIsPlaying((p) => !p)}
-                      disabled={markersSorted.length === 0}
+                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ opacity: 0.75 }}>Speed</span>
+                    <select
+                      style={{ ...styles.select, width: 110, padding: "8px 10px" }}
+                      value={playbackSpeed}
+                      onChange={(e) => setPlaybackSpeed(Number(e.target.value) as any)}
                     >
-                      {isPlaying ? "Pause replay" : "Play replay"}
-                    </button>
+                      <option value={1}>1×</option>
+                      <option value={2}>2×</option>
+                      <option value={4}>4×</option>
+                      <option value={8}>8×</option>
+                    </select>
+                  </label>
 
-                    <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
-                      <span style={{ opacity: 0.75 }}>Speed</span>
-                      <select
-                        style={{ ...styles.select, width: 110, padding: "8px 10px" }}
-                        value={playbackSpeed}
-                        onChange={(e) => setPlaybackSpeed(Number(e.target.value) as any)}
-                      >
-                        <option value={1}>1×</option>
-                        <option value={2}>2×</option>
-                        <option value={4}>4×</option>
-                        <option value={8}>8×</option>
-                      </select>
-                    </label>
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setPlaybackPos(0);
+                    }}
+                    disabled={markersSorted.length === 0}
+                  >
+                    Rewind
+                  </button>
 
-                    <button
-                      style={styles.buttonSecondary}
-                      onClick={() => {
-                        setIsPlaying(false);
-                        setPlaybackPos(0);
-                      }}
-                      disabled={markersSorted.length === 0}
-                    >
-                      Rewind
-                    </button>
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setPlaybackPos(1000);
+                    }}
+                    disabled={markersSorted.length === 0}
+                  >
+                    End
+                  </button>
 
-                    <button
-                      style={styles.buttonSecondary}
-                      onClick={() => {
-                        setIsPlaying(false);
-                        setPlaybackPos(1000);
-                      }}
-                      disabled={markersSorted.length === 0}
-                    >
-                      End
-                    </button>
-                  </>
-                )}
+                  <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>
+                    {playbackLabel ?? "Playback: no data yet."}
+                  </div>
 
-                <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>
-                  {playbackEnabled ? playbackLabel ?? "Playback: no data yet." : "Playback is off."}
-                </div>
-
-                {playbackEnabled && (
                   <div style={{ width: "100%" }}>
                     <input
                       type="range"
@@ -1072,11 +1204,11 @@ export default function Page() {
                       disabled={markersSorted.length === 0}
                     />
                   </div>
-                )}
-              </div>
+                </div>
+              )}
 
               {/* Filters */}
-              <div style={{ marginTop: 12 }}>
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #eef2f7" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div style={{ fontWeight: 900, fontSize: 13 }}>Filters</div>
                   <button style={styles.buttonSecondary} onClick={clearFilters}>
@@ -1148,9 +1280,80 @@ export default function Page() {
                 <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <span style={styles.pill}>Showing: {reviewMarkers.length}</span>
                   <span style={styles.pill}>Total stored: {markers.length}</span>
-                  <span style={styles.pill}>Live: {legendCounts.live}</span>
-                  <span style={styles.pill}>Imported: {legendCounts.imp}</span>
+                  <span style={styles.pill}>Zones: {zones.length}</span>
                 </div>
+              </div>
+
+              {/* Zone editor */}
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #eef2f7" }}>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor: zoneEditorOn ? "#111" : "#d0d5dd",
+                      background: zoneEditorOn ? "#111" : "#fff",
+                      color: zoneEditorOn ? "#fff" : "#111",
+                    }}
+                    onClick={() => {
+                      setZoneEditorOn((v) => !v);
+                      setIsDrawingZone(false);
+                      setDragStart(null);
+                      setDragNow(null);
+                    }}
+                  >
+                    Zone editor {zoneEditorOn ? "ON" : "OFF"}
+                  </button>
+
+                  <div style={{ width: 260 }}>
+                    <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Zone name for next rectangle</div>
+                    <input
+                      style={styles.input}
+                      value={zoneDraftName}
+                      onChange={(e) => setZoneDraftName(e.target.value)}
+                      placeholder="e.g., Lab / Galley / EVA prep"
+                      disabled={!zoneEditorOn}
+                    />
+                  </div>
+
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>
+                    When ON: drag on the plan to create a rectangle zone (saved locally).
+                  </span>
+                </div>
+
+                {zones.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 8 }}>Zones</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {zones
+                        .slice()
+                        .sort((a, b) => b.createdAt - a.createdAt)
+                        .map((z) => (
+                          <div
+                            key={z.id}
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "center",
+                              border: "1px solid #e5e7eb",
+                              borderRadius: 10,
+                              padding: "8px 10px",
+                              fontSize: 12,
+                            }}
+                          >
+                            <div>
+                              <b>{z.name}</b>{" "}
+                              <span style={{ opacity: 0.7 }}>
+                                ({z.x1.toFixed(3)},{z.y1.toFixed(3)})–({z.x2.toFixed(3)},{z.y2.toFixed(3)})
+                              </span>
+                            </div>
+                            <button style={styles.buttonSecondary} onClick={() => deleteZone(z.id)}>
+                              Delete
+                            </button>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1182,14 +1385,7 @@ export default function Page() {
                     }}
                     title={`${a.label} (${legendCounts.byActivity.get(a.key) || 0})`}
                   >
-                    <span
-                      style={{
-                        width: 10,
-                        height: 10,
-                        borderRadius: 999,
-                        background: a.color,
-                      }}
-                    />
+                    <span style={{ width: 10, height: 10, borderRadius: 999, background: a.color }} />
                     {a.label} ({legendCounts.byActivity.get(a.key) || 0})
                   </span>
                 ))}
@@ -1199,7 +1395,7 @@ export default function Page() {
                   <b>Dot ring</b>: green = cloud ok, red = cloud fail, white = pending
                 </span>
                 <span>
-                  <b>Source</b>: live = solid; imported = dashed outline
+                  <b>Zones</b>: rectangles drawn in Zone editor; marker zone computed at record time (or Recompute).
                 </span>
               </div>
             </div>
@@ -1225,7 +1421,8 @@ export default function Page() {
               </>
             ) : (
               <>
-                · Showing filtered markers {playbackEnabled ? "(with playback)" : ""}.
+                · Showing filtered markers {playbackEnabled ? "(with playback)" : ""}{" "}
+                {zoneEditorOn ? "· Zone editor ON (drag to create rectangles)" : ""}
               </>
             )}
           </div>
@@ -1233,12 +1430,21 @@ export default function Page() {
           <div
             ref={containerRef}
             onClick={handleClick}
+            onMouseDown={onPlanMouseDown}
+            onMouseMove={onPlanMouseMove}
+            onMouseUp={onPlanMouseUp}
             style={{
               position: "relative",
               height: "72vh",
               minHeight: 560,
               background: "#fafafa",
-              cursor: tab === "collect" && isRunning ? "crosshair" : "default",
+              cursor:
+                tab === "review" && zoneEditorOn
+                  ? "crosshair"
+                  : tab === "collect" && isRunning
+                  ? "crosshair"
+                  : "default",
+              userSelect: "none",
             }}
           >
             <img
@@ -1255,6 +1461,48 @@ export default function Page() {
               }}
             />
 
+            {/* Zone rectangles overlay */}
+            {zones.map((z) => (
+              <div
+                key={z.id}
+                title={`Zone: ${z.name}`}
+                style={{
+                  position: "absolute",
+                  left: `${z.x1 * 100}%`,
+                  top: `${z.y1 * 100}%`,
+                  width: `${(z.x2 - z.x1) * 100}%`,
+                  height: `${(z.y2 - z.y1) * 100}%`,
+                  border: "2px solid rgba(0,0,0,0.35)",
+                  background: "rgba(0,0,0,0.03)",
+                  zIndex: 3,
+                  pointerEvents: "none",
+                }}
+              />
+            ))}
+
+            {/* Draft rectangle while drawing */}
+            {tab === "review" && zoneEditorOn && isDrawingZone && dragStart && dragNow ? (
+              (() => {
+                const r = rectNormalize(dragStart, dragNow);
+                return (
+                  <div
+                    style={{
+                      position: "absolute",
+                      left: `${r.x1 * 100}%`,
+                      top: `${r.y1 * 100}%`,
+                      width: `${(r.x2 - r.x1) * 100}%`,
+                      height: `${(r.y2 - r.y1) * 100}%`,
+                      border: "2px dashed rgba(17,17,17,0.65)",
+                      background: "rgba(17,17,17,0.06)",
+                      zIndex: 4,
+                      pointerEvents: "none",
+                    }}
+                  />
+                );
+              })()
+            ) : null}
+
+            {/* Markers */}
             {markersToRender.map((m) => {
               const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
               const ring =
@@ -1275,7 +1523,6 @@ export default function Page() {
                     `Activity: ${m.activity}`,
                     `Zone: ${m.zone}`,
                     `Interval: ${m.intervalLabel}`,
-                    `Source: ${m.source ?? "live"}`,
                     `Cloud: ${m.cloudStatus ?? "pending"}`,
                     m.note ? `Note: ${m.note}` : "",
                   ]
@@ -1293,7 +1540,7 @@ export default function Page() {
                     border: ring,
                     outline: isImport ? "2px dashed rgba(0,0,0,0.35)" : "none",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
-                    zIndex: 5,
+                    zIndex: 6,
                   }}
                 />
               );
@@ -1302,7 +1549,7 @@ export default function Page() {
         </div>
 
         <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-          Zones: edit the <b>ZONES</b> array near the top of the file to match your plan.
+          Zones are saved locally in your browser. If you open the app on a different device/browser, re-draw them (or we can add import/export zones next).
         </div>
       </div>
 
