@@ -4,6 +4,8 @@ A lightweight web-based tool for structured field observation in analogue space 
 
 Developed within **Cambridge Cognitive Architecture (CCA)**.
 
+https://www.cca.arct.cam.ac.uk/
+
 ---
 
 ## Overview
@@ -90,8 +92,7 @@ If you use or adapt this tool in academic work, please cite it as:
 
 **APA style**
 
-Gath-Morad, M., Wang, A., & Aguilar, L. (2026). *Analogue Mission Observation Mapper (CCA)* [Software]. Cambridge Cognitive Architecture, University of Cambridge.  
-Available at: *URL to be added*
+Wang, A., Aguilar, L, & Gath-Morad, M.,(2026). *Analogue Mission Observation Mapper (CCA)* [Software]. Cambridge Cognitive Architecture, University of Cambridge. 
 
 ---
 
