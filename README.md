@@ -1,36 +1,103 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Analogue Mission Observation Mapper (CCA)
 
-## Getting Started
+A lightweight web-based tool for structured field observation in analogue space mission and habitat settings.
 
-First, run the development server:
+Developed within **Cambridge Cognitive Architecture (CCA)**.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+---
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Overview
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+This app supports **time-based, spatially anchored observations** on a floorplan.  
+Observers record activity-coded points during fixed intervals, annotated with role and badge number, and export the data for analysis.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+The tool is designed for:
+- analogue space missions
+- habitat studies
+- high-stakes / confined environments
+- pilot studies and fieldwork
 
-## Learn More
+---
 
-To learn more about Next.js, take a look at the following resources:
+## Core features
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Timed observation intervals (e.g. 5 minutes) with automatic rollover  
+- Click-to-record observations on a floorplan  
+- Activity coding (e.g. walking, sitting, computer work, socialising)  
+- Role attribution (e.g. commander, engineer, scientist)  
+- Badge number per observed individual (shadowing)  
+- Optional group flag and free-text notes  
+- Normalised spatial coordinates (x, y in 0–1 range)  
+- Automatic zone assignment based on plan geometry  
+- CSV export for downstream analysis  
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+---
 
-## Deploy on Vercel
+## Zones
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Zones are defined directly in the code (`app/page.tsx`) as normalised rectangles.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Each observation is assigned to a zone at the moment of recording.  
+If no zone matches, the observation is labelled `Unassigned`.
+
+This approach allows:
+- consistent zone classification across devices  
+- easy adjustment of zone boundaries during piloting  
+
+---
+
+## Data export
+
+Data are exported manually as a CSV file.  
+Each row corresponds to one observation point and includes:
+
+- timestamp (ISO)  
+- observer  
+- site  
+- interval index and label  
+- badge number  
+- role  
+- activity  
+- group flag  
+- x and y (normalised coordinates)  
+- zone  
+- note  
+
+No data are stored on a server.
+
+---
+
+## Intended use
+
+This tool is currently intended for:
+- pilot studies  
+- method development  
+- internal research use within CCA  
+
+Please avoid modifying the live version mid-study.
+
+---
+
+## Deployment
+
+The app is built with Next.js and can be deployed using Vercel (free tier is sufficient).
+
+---
+
+## Citation
+
+If you use or adapt this tool in academic work, please cite it as:
+
+**APA style**
+
+Gath-Morad, M., Wang, A., & Aguilar, L. (2026). *Analogue Mission Observation Mapper (CCA)* [Software]. Cambridge Cognitive Architecture, University of Cambridge.  
+Available at: *URL to be added*
+
+---
+
+## Status
+
+Early working version (pilot).
+
+
+
