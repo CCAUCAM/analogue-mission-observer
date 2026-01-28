@@ -128,9 +128,6 @@ function csvEscape(value: string) {
   return v;
 }
 
-/**
- * Robust-enough CSV parser for our exported CSV.
- */
 function parseCSV(text: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
@@ -174,6 +171,21 @@ function parseCSV(text: string): string[][] {
 }
 
 /* =======================
+   CLOUD WRITE (Sheets)
+======================= */
+
+async function sendToSheets(payload: Record<string, any>) {
+  if (!SHEETS_WEBHOOK_URL) throw new Error("Sheets webhook URL missing.");
+  await fetch(SHEETS_WEBHOOK_URL, {
+    method: "POST",
+    mode: "no-cors",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(payload),
+  });
+  return true;
+}
+
+/* =======================
    UI STYLES
 ======================= */
 
@@ -202,7 +214,7 @@ const styles = {
     border: "1px solid #111",
     background: "#111",
     color: "#fff",
-    fontWeight: 700,
+    fontWeight: 800,
     cursor: "pointer",
   } as React.CSSProperties,
   buttonSecondary: {
@@ -211,7 +223,7 @@ const styles = {
     border: "1px solid #d0d5dd",
     background: "#fff",
     color: "#111",
-    fontWeight: 700,
+    fontWeight: 800,
     cursor: "pointer",
   } as React.CSSProperties,
   pill: {
@@ -220,35 +232,21 @@ const styles = {
     border: "1px solid #d0d5dd",
     background: "#fff",
     fontSize: 12,
-    fontWeight: 700,
+    fontWeight: 800,
   } as React.CSSProperties,
 };
-
-/* =======================
-   CLOUD WRITE (Sheets)
-   - no-cors + text/plain avoids CORS/preflight
-======================= */
-
-async function sendToSheets(payload: Record<string, any>) {
-  if (!SHEETS_WEBHOOK_URL) throw new Error("Sheets webhook URL missing.");
-
-  await fetch(SHEETS_WEBHOOK_URL, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
-  });
-
-  // no-cors: we can't read response; resolved fetch means "sent".
-  return true;
-}
 
 /* =======================
    MAIN COMPONENT
 ======================= */
 
+type Tab = "collect" | "review";
+
 export default function Page() {
   const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // bottom tabs
+  const [tab, setTab] = useState<Tab>("collect");
 
   // Session settings
   const [observerName, setObserverName] = useState("Observer 1");
@@ -274,7 +272,7 @@ export default function Page() {
   const [statusMsg, setStatusMsg] = useState<string>("");
   const [lastRecorded, setLastRecorded] = useState<string>("");
 
-  // TEST status
+  // Review tools
   const [testStatus, setTestStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [testHint, setTestHint] = useState<string>("");
 
@@ -292,15 +290,14 @@ export default function Page() {
   const [playbackEnabled, setPlaybackEnabled] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2 | 4 | 8>(2);
-  // Slider is 0..1000 (stable UI), maps to time window
   const [playbackPos, setPlaybackPos] = useState(1000);
 
-  // keep timeLeft synced when not running
+  // Keep timeLeft synced when not running
   useEffect(() => {
     if (!isRunning) setTimeLeft(intervalSeconds);
   }, [intervalSeconds, isRunning]);
 
-  // timer tick
+  // Timer tick
   useEffect(() => {
     if (!isRunning || intervalStart === null) return;
 
@@ -334,42 +331,34 @@ export default function Page() {
     [activity]
   );
 
-  // Sorted markers (stable for playback)
-  const markersSorted = useMemo(() => {
-    return [...markers].sort((a, b) => a.createdAt - b.createdAt);
-  }, [markers]);
+  // Sorted markers for playback
+  const markersSorted = useMemo(() => [...markers].sort((a, b) => a.createdAt - b.createdAt), [markers]);
 
   const playbackWindow = useMemo(() => {
     if (markersSorted.length === 0) return null;
-    const minT = markersSorted[0].createdAt;
-    const maxT = markersSorted[markersSorted.length - 1].createdAt;
-    return { minT, maxT };
+    return { minT: markersSorted[0].createdAt, maxT: markersSorted[markersSorted.length - 1].createdAt };
   }, [markersSorted]);
 
   const playbackCutoffTime = useMemo(() => {
     if (!playbackWindow) return null;
     const { minT, maxT } = playbackWindow;
-    const t = minT + ((maxT - minT) * playbackPos) / 1000;
-    return t;
+    return minT + ((maxT - minT) * playbackPos) / 1000;
   }, [playbackWindow, playbackPos]);
 
-  // playback tick
   useEffect(() => {
     if (!playbackEnabled || !isPlaying) return;
     if (!playbackWindow) return;
 
     const { minT, maxT } = playbackWindow;
     const total = Math.max(1, maxT - minT);
-    const stepMs = 120 * playbackSpeed; // feel-good speed; adjust anytime
+    const stepMs = 120 * playbackSpeed;
 
     const id = setInterval(() => {
       setPlaybackPos((p) => {
         const currentT = minT + (total * p) / 1000;
         const nextT = currentT + stepMs;
         const nextP = Math.round(((nextT - minT) / total) * 1000);
-
         if (nextP >= 1000) {
-          // stop at end
           setIsPlaying(false);
           return 1000;
         }
@@ -380,12 +369,12 @@ export default function Page() {
     return () => clearInterval(id);
   }, [playbackEnabled, isPlaying, playbackSpeed, playbackWindow]);
 
-  // If user turns on playback, default to end
   useEffect(() => {
     if (playbackEnabled) setPlaybackPos(1000);
     setIsPlaying(false);
   }, [playbackEnabled]);
 
+  // Controls
   function start() {
     const now = Date.now();
     setIntervalStart(now);
@@ -394,7 +383,6 @@ export default function Page() {
     setIsRunning(true);
     setStatusMsg("");
   }
-
   function pauseResume() {
     if (!isRunning) {
       const now = Date.now();
@@ -407,7 +395,6 @@ export default function Page() {
       setStatusMsg("Paused");
     }
   }
-
   function reset() {
     setIsRunning(false);
     setIntervalStart(null);
@@ -473,9 +460,8 @@ export default function Page() {
   async function sendTestRow() {
     setTestStatus("sending");
     setTestHint("");
-
     try {
-      const payload = {
+      await sendToSheets({
         created_at_iso: new Date().toISOString(),
         observer: observerName,
         site: buildingSite,
@@ -483,17 +469,14 @@ export default function Page() {
         interval_index: intervalIndex,
         interval_label: intervalLabel,
         badge: "TEST",
-        role: role,
-        activity: activity,
+        role,
+        activity,
         group: false,
         x_norm: 0.5,
         y_norm: 0.5,
         zone: "TEST",
         note: "TEST ROW — sent from app",
-      };
-
-      await sendToSheets(payload);
-
+      });
       setTestStatus("sent");
       setTestHint("Sent ✓ Now check the Google Sheet (tab: observations).");
       window.setTimeout(() => setTestStatus("idle"), 3500);
@@ -512,11 +495,7 @@ export default function Page() {
     try {
       const text = await file.text();
       const rows = parseCSV(text);
-
-      if (rows.length < 2) {
-        setStatusMsg("CSV looks empty.");
-        return;
-      }
+      if (rows.length < 2) return setStatusMsg("CSV looks empty.");
 
       const header = rows[0].map((h) => h.trim());
       const idx = (name: string) => header.indexOf(name);
@@ -537,19 +516,14 @@ export default function Page() {
         "zone",
         "note",
       ];
-
       const missing = required.filter((k) => idx(k) === -1);
-      if (missing.length) {
-        setStatusMsg(`CSV missing columns: ${missing.join(", ")}`);
-        return;
-      }
+      if (missing.length) return setStatusMsg(`CSV missing columns: ${missing.join(", ")}`);
 
       const roleKeys = new Set(ROLES.map((r) => r.key));
       const activityKeys = new Set(ACTIVITY.map((a) => a.key));
 
       const imported: Marker[] = rows.slice(1).map((r) => {
         const createdAt = Date.parse(r[idx("created_at_iso")] || "") || Date.now();
-
         const x = Number(r[idx("x_norm")] || 0);
         const y = Number(r[idx("y_norm")] || 0);
 
@@ -567,19 +541,14 @@ export default function Page() {
           createdAt,
           intervalIndex: Number(r[idx("interval_index")] || 0),
           intervalLabel: r[idx("interval_label")] || "—",
-
           observerName: r[idx("observer")] || "Observer 1",
           buildingSite: r[idx("site")] || "Habitat A",
-
           badgeNumber: r[idx("badge")] || "",
           role: safeRole,
-
           activity: safeActivity,
           isGroup,
-
           x: isFinite(x) ? Math.min(1, Math.max(0, x)) : 0,
           y: isFinite(y) ? Math.min(1, Math.max(0, y)) : 0,
-
           zone: r[idx("zone")] || zoneForPoint(x, y),
           note: r[idx("note")] || "",
           cloudStatus: "ok",
@@ -593,8 +562,8 @@ export default function Page() {
       setPlaybackEnabled(true);
       setPlaybackPos(1000);
       setIsPlaying(false);
-
       setStatusMsg(`Loaded ${imported.length} markers from CSV (${importMode}).`);
+      setTab("review");
     } catch (err: any) {
       setStatusMsg(`Import failed: ${String(err)}`);
     }
@@ -603,15 +572,8 @@ export default function Page() {
   async function handleClick(e: React.MouseEvent) {
     setStatusMsg("");
 
-    if (!isRunning || intervalStart === null) {
-      setStatusMsg("Press Start to begin recording.");
-      return;
-    }
-
-    if (!badgeNumber.trim()) {
-      setStatusMsg("Enter a badge number before recording.");
-      return;
-    }
+    if (!isRunning || intervalStart === null) return setStatusMsg("Press Start to begin recording.");
+    if (!badgeNumber.trim()) return setStatusMsg("Enter a badge number before recording.");
 
     const el = containerRef.current;
     if (!el) return;
@@ -683,23 +645,19 @@ export default function Page() {
       });
   }
 
-  // Filter + playback pipeline
+  // Review pipeline: filters + playback
   const filteredMarkers = useMemo(() => {
     const badgeQ = filterBadge.trim().toLowerCase();
-
     return markersSorted.filter((m) => {
       if (filterRole !== "all" && m.role !== filterRole) return false;
       if (filterActivity !== "all" && m.activity !== filterActivity) return false;
       if (filterGroupOnly && !m.isGroup) return false;
-      if (badgeQ) {
-        const b = (m.badgeNumber || "").toLowerCase();
-        if (!b.includes(badgeQ)) return false;
-      }
+      if (badgeQ && !(m.badgeNumber || "").toLowerCase().includes(badgeQ)) return false;
       return true;
     });
   }, [markersSorted, filterBadge, filterRole, filterActivity, filterGroupOnly]);
 
-  const playbackMarkers = useMemo(() => {
+  const reviewMarkers = useMemo(() => {
     if (!playbackEnabled || !playbackCutoffTime) return filteredMarkers;
     return filteredMarkers.filter((m) => m.createdAt <= playbackCutoffTime);
   }, [filteredMarkers, playbackEnabled, playbackCutoffTime]);
@@ -711,11 +669,17 @@ export default function Page() {
 
   const playbackLabel = useMemo(() => {
     if (!playbackEnabled || !playbackWindow || playbackCutoffTime === null) return null;
-    const t = new Date(playbackCutoffTime);
-    const minT = new Date(playbackWindow.minT);
-    const maxT = new Date(playbackWindow.maxT);
-    return `Playback time: ${formatHMS(t)} (from ${formatHMS(minT)} to ${formatHMS(maxT)})`;
+    return `Playback time: ${formatHMS(new Date(playbackCutoffTime))}`;
   }, [playbackEnabled, playbackWindow, playbackCutoffTime]);
+
+  const legendCounts = useMemo(() => {
+    const byActivity = new Map<ActivityType, number>();
+    for (const a of ACTIVITY) byActivity.set(a.key, 0);
+    for (const m of reviewMarkers) byActivity.set(m.activity, (byActivity.get(m.activity) || 0) + 1);
+    const live = reviewMarkers.filter((m) => (m.source ?? "live") === "live").length;
+    const imp = reviewMarkers.filter((m) => m.source === "import").length;
+    return { byActivity, live, imp, total: reviewMarkers.length };
+  }, [reviewMarkers]);
 
   function clearFilters() {
     setFilterBadge("");
@@ -733,20 +697,11 @@ export default function Page() {
       ? "Failed ✕"
       : "Send TEST row";
 
-  // Legend counts
-  const legendCounts = useMemo(() => {
-    const byActivity = new Map<ActivityType, number>();
-    for (const a of ACTIVITY) byActivity.set(a.key, 0);
-    for (const m of playbackMarkers) byActivity.set(m.activity, (byActivity.get(m.activity) || 0) + 1);
-
-    const live = playbackMarkers.filter((m) => (m.source ?? "live") === "live").length;
-    const imp = playbackMarkers.filter((m) => m.source === "import").length;
-
-    return { byActivity, live, imp, total: playbackMarkers.length };
-  }, [playbackMarkers]);
+  // Dot rendering: Collect shows ALL markers; Review shows reviewMarkers
+  const markersToRender = tab === "collect" ? markersSorted : reviewMarkers;
 
   return (
-    <div style={{ background: "#fff", minHeight: "100vh", color: "#111" }}>
+    <div style={{ background: "#fff", minHeight: "100vh", color: "#111", paddingBottom: 84 }}>
       {/* HEADER */}
       <header
         style={{
@@ -759,366 +714,108 @@ export default function Page() {
       >
         <img src="/logoCCAweb.png" alt="CCA logo" style={{ height: 46 }} />
         <div style={{ display: "flex", flexDirection: "column" }}>
-          <div style={{ fontWeight: 800, fontSize: 16 }}>Analogue Mission Observation Mapper</div>
+          <div style={{ fontWeight: 900, fontSize: 16 }}>Analogue Mission Observation Mapper</div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>University of Cambridge</div>
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={styles.pill}>Tab: {tab === "collect" ? "Collect" : "Review"}</span>
+          <span style={styles.pill}>Markers: {markers.length}</span>
         </div>
       </header>
 
       <div style={{ padding: 20, maxWidth: 1200, margin: "0 auto" }}>
-        {/* CONTROLS CARD */}
-        <div
-          style={{
-            border: "1px solid #e5e7eb",
-            borderRadius: 14,
-            padding: 14,
-            background: "#fff",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-          }}
-        >
-          {/* Row 1 */}
+        {/* ===== COLLECT TAB ===== */}
+        {tab === "collect" && (
           <div
             style={{
-              display: "grid",
-              gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.6fr",
-              gap: 12,
-              alignItems: "end",
+              border: "1px solid #e5e7eb",
+              borderRadius: 14,
+              padding: 14,
+              background: "#fff",
+              boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
             }}
           >
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Observer</div>
-              <select
-                style={styles.select}
-                value={observerName}
-                onChange={(e) => setObserverName(e.target.value)}
-              >
-                <option>Observer 1</option>
-                <option>Observer 2</option>
-                <option>Observer 3</option>
-              </select>
-            </div>
-
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Site</div>
-              <select
-                style={styles.select}
-                value={buildingSite}
-                onChange={(e) => setBuildingSite(e.target.value)}
-              >
-                <option>Habitat A</option>
-                <option>Habitat B</option>
-                <option>Control Room</option>
-                <option>Lab Module</option>
-                <option>Airlock / EVA Prep</option>
-              </select>
-            </div>
-
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Interval (min)</div>
-              <input
-                style={styles.input}
-                type="number"
-                min={1}
-                value={intervalMinutes}
-                disabled={isRunning}
-                onChange={(e) => setIntervalMinutes(Number(e.target.value || 5))}
-              />
-            </div>
-
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
-              <button style={styles.buttonPrimary} onClick={start}>
-                Start
-              </button>
-              <button style={styles.buttonSecondary} onClick={pauseResume}>
-                {isRunning ? "Pause" : "Resume"}
-              </button>
-              <button style={styles.buttonSecondary} onClick={reset}>
-                Reset
-              </button>
-              <button
-                style={{
-                  ...styles.buttonSecondary,
-                  opacity: markers.length ? 1 : 0.5,
-                  cursor: markers.length ? "pointer" : "not-allowed",
-                }}
-                onClick={exportCSV}
-                disabled={markers.length === 0}
-              >
-                Export CSV
-              </button>
-
-              <button
-                style={{
-                  ...styles.buttonSecondary,
-                  borderColor:
-                    testStatus === "failed"
-                      ? "#ef4444"
-                      : testStatus === "sent"
-                      ? "#22c55e"
-                      : "#d0d5dd",
-                }}
-                onClick={sendTestRow}
-                disabled={testStatus === "sending"}
-              >
-                {testButtonLabel}
-              </button>
-
-              <button style={styles.buttonSecondary} onClick={onPickCSV}>
-                Load CSV (replay)
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".csv,text/csv"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleImportCSV(f);
-                  if (e.target) e.target.value = "";
-                }}
-              />
-            </div>
-          </div>
-
-          {/* Row 1.5: import mode + playback toggle */}
-          <div
-            style={{
-              marginTop: 10,
-              display: "flex",
-              gap: 14,
-              alignItems: "center",
-              justifyContent: "space-between",
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-              <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
-                <span style={{ opacity: 0.75 }}>Import mode</span>
-                <select
-                  style={{ ...styles.select, width: 160, padding: "8px 10px" }}
-                  value={importMode}
-                  onChange={(e) => setImportMode(e.target.value as any)}
-                >
-                  <option value="replace">Replace</option>
-                  <option value="append">Append</option>
-                </select>
-              </label>
-
-              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
-                <input
-                  type="checkbox"
-                  checked={playbackEnabled}
-                  onChange={(e) => setPlaybackEnabled(e.target.checked)}
-                />
-                Playback
-              </label>
-
-              {playbackEnabled && (
-                <>
-                  <button
-                    style={styles.buttonSecondary}
-                    onClick={() => setIsPlaying((p) => !p)}
-                    disabled={markersSorted.length === 0}
-                  >
-                    {isPlaying ? "Pause replay" : "Play replay"}
-                  </button>
-
-                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
-                    <span style={{ opacity: 0.75 }}>Speed</span>
-                    <select
-                      style={{ ...styles.select, width: 110, padding: "8px 10px" }}
-                      value={playbackSpeed}
-                      onChange={(e) => setPlaybackSpeed(Number(e.target.value) as any)}
-                    >
-                      <option value={1}>1×</option>
-                      <option value={2}>2×</option>
-                      <option value={4}>4×</option>
-                      <option value={8}>8×</option>
-                    </select>
-                  </label>
-
-                  <button
-                    style={styles.buttonSecondary}
-                    onClick={() => {
-                      setIsPlaying(false);
-                      setPlaybackPos(0);
-                    }}
-                    disabled={markersSorted.length === 0}
-                  >
-                    Rewind
-                  </button>
-
-                  <button
-                    style={styles.buttonSecondary}
-                    onClick={() => {
-                      setIsPlaying(false);
-                      setPlaybackPos(1000);
-                    }}
-                    disabled={markersSorted.length === 0}
-                  >
-                    End
-                  </button>
-                </>
-              )}
-            </div>
-
-            <div style={{ fontSize: 12, opacity: 0.85 }}>
-              {testHint ? (
-                <span>{testHint}</span>
-              ) : (
-                <span>
-                  Cloud test sends a row with badge <b>TEST</b> to your Sheet.
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Playback slider */}
-          {playbackEnabled && (
-            <div style={{ marginTop: 10 }}>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                {playbackLabel ?? "Playback: load data or record markers to enable timeline."}
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={1000}
-                value={playbackPos}
-                onChange={(e) => {
-                  setIsPlaying(false);
-                  setPlaybackPos(Number(e.target.value));
-                }}
-                style={{ width: "100%" }}
-                disabled={markersSorted.length === 0}
-              />
-            </div>
-          )}
-
-          {/* Row 2 */}
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1.2fr 1fr 1fr auto",
-              gap: 12,
-              marginTop: 12,
-              alignItems: "end",
-            }}
-          >
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                Badge number (shadowed person)
-              </div>
-              <input
-                style={styles.input}
-                value={badgeNumber}
-                onChange={(e) => setBadgeNumber(e.target.value)}
-                placeholder="e.g., 014"
-              />
-            </div>
-
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
-              <select
-                style={styles.select}
-                value={role}
-                onChange={(e) => setRole(e.target.value as RoleType)}
-              >
-                {ROLES.map((r) => (
-                  <option key={r.key} value={r.key}>
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Note (optional)</div>
-              <input
-                style={styles.input}
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder="e.g., pre-EVA checklist / quiet reading"
-              />
-            </div>
-
-            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
-              <input
-                type="checkbox"
-                checked={isGroup}
-                onChange={(e) => setIsGroup(e.target.checked)}
-              />
-              Group
-            </label>
-          </div>
-
-          {/* Activity buttons */}
-          <div style={{ marginTop: 12 }}>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>Activity</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {ACTIVITY.map((a) => {
-                const selected = a.key === activity;
-                return (
-                  <button
-                    key={a.key}
-                    onClick={() => setActivity(a.key)}
-                    style={{
-                      padding: "9px 12px",
-                      borderRadius: 999,
-                      border: selected ? "2px solid #111" : "1px solid #d0d5dd",
-                      background: selected ? "#111" : "#fff",
-                      color: selected ? "#fff" : "#111",
-                      fontWeight: 800,
-                      cursor: "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: 10,
-                        height: 10,
-                        borderRadius: 999,
-                        background: a.color,
-                        outline: selected ? "2px solid rgba(255,255,255,0.7)" : "none",
-                      }}
-                    />
-                    {a.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* FILTERS */}
-          <div
-            style={{
-              marginTop: 14,
-              paddingTop: 12,
-              borderTop: "1px solid #eef2f7",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontWeight: 900, fontSize: 13 }}>Filters (what you see on the plan)</div>
-              <button style={styles.buttonSecondary} onClick={clearFilters}>
-                Clear filters
-              </button>
-            </div>
-
+            {/* Session + Start/Pause */}
             <div
               style={{
-                marginTop: 10,
                 display: "grid",
-                gridTemplateColumns: "1.2fr 1fr 1fr auto",
+                gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.6fr",
                 gap: 12,
                 alignItems: "end",
               }}
             >
               <div>
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Badge contains</div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Observer</div>
+                <select
+                  style={styles.select}
+                  value={observerName}
+                  onChange={(e) => setObserverName(e.target.value)}
+                >
+                  <option>Observer 1</option>
+                  <option>Observer 2</option>
+                  <option>Observer 3</option>
+                </select>
+              </div>
+
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Site</div>
+                <select
+                  style={styles.select}
+                  value={buildingSite}
+                  onChange={(e) => setBuildingSite(e.target.value)}
+                >
+                  <option>Habitat A</option>
+                  <option>Habitat B</option>
+                  <option>Control Room</option>
+                  <option>Lab Module</option>
+                  <option>Airlock / EVA Prep</option>
+                </select>
+              </div>
+
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Interval (min)</div>
                 <input
                   style={styles.input}
-                  value={filterBadge}
-                  onChange={(e) => setFilterBadge(e.target.value)}
+                  type="number"
+                  min={1}
+                  value={intervalMinutes}
+                  disabled={isRunning}
+                  onChange={(e) => setIntervalMinutes(Number(e.target.value || 5))}
+                />
+              </div>
+
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                <button style={styles.buttonPrimary} onClick={start}>
+                  Start
+                </button>
+                <button style={styles.buttonSecondary} onClick={pauseResume}>
+                  {isRunning ? "Pause" : "Resume"}
+                </button>
+                <button style={styles.buttonSecondary} onClick={reset}>
+                  Reset
+                </button>
+              </div>
+            </div>
+
+            {/* Per-person fields */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1.2fr 1fr 1fr auto",
+                gap: 12,
+                marginTop: 12,
+                alignItems: "end",
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                  Badge number (shadowed person)
+                </div>
+                <input
+                  style={styles.input}
+                  value={badgeNumber}
+                  onChange={(e) => setBadgeNumber(e.target.value)}
                   placeholder="e.g., 014"
                 />
               </div>
@@ -1127,10 +824,9 @@ export default function Page() {
                 <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
                 <select
                   style={styles.select}
-                  value={filterRole}
-                  onChange={(e) => setFilterRole(e.target.value as any)}
+                  value={role}
+                  onChange={(e) => setRole(e.target.value as RoleType)}
                 >
-                  <option value="all">All roles</option>
                   {ROLES.map((r) => (
                     <option key={r.key} value={r.key}>
                       {r.label}
@@ -1140,110 +836,377 @@ export default function Page() {
               </div>
 
               <div>
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Activity</div>
-                <select
-                  style={styles.select}
-                  value={filterActivity}
-                  onChange={(e) => setFilterActivity(e.target.value as any)}
-                >
-                  <option value="all">All activities</option>
-                  {ACTIVITY.map((a) => (
-                    <option key={a.key} value={a.key}>
-                      {a.label}
-                    </option>
-                  ))}
-                </select>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Note (optional)</div>
+                <input
+                  style={styles.input}
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="e.g., pre-EVA checklist / quiet reading"
+                />
               </div>
 
-              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
                 <input
                   type="checkbox"
-                  checked={filterGroupOnly}
-                  onChange={(e) => setFilterGroupOnly(e.target.checked)}
+                  checked={isGroup}
+                  onChange={(e) => setIsGroup(e.target.checked)}
                 />
-                Group only
+                Group
               </label>
             </div>
 
-            <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <span style={styles.pill}>Showing: {playbackMarkers.length}</span>
-              <span style={styles.pill}>Total stored: {markers.length}</span>
-              <span style={styles.pill}>Live: {legendCounts.live}</span>
-              <span style={styles.pill}>Imported: {legendCounts.imp}</span>
+            {/* Activity buttons */}
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>Activity</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {ACTIVITY.map((a) => {
+                  const selected = a.key === activity;
+                  return (
+                    <button
+                      key={a.key}
+                      onClick={() => setActivity(a.key)}
+                      style={{
+                        padding: "9px 12px",
+                        borderRadius: 999,
+                        border: selected ? "2px solid #111" : "1px solid #d0d5dd",
+                        background: selected ? "#111" : "#fff",
+                        color: selected ? "#fff" : "#111",
+                        fontWeight: 900,
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 10,
+                          height: 10,
+                          borderRadius: 999,
+                          background: a.color,
+                          outline: selected ? "2px solid rgba(255,255,255,0.7)" : "none",
+                        }}
+                      />
+                      {a.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Status line */}
+            <div style={{ marginTop: 12, fontSize: 13 }}>
+              <span style={{ fontWeight: 900 }}>
+                Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This
+                interval: {thisIntervalCount}
+              </span>
+              {statusMsg ? (
+                <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 900 }}>
+                  {statusMsg}
+                </span>
+              ) : null}
+              {lastRecorded ? <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div> : null}
             </div>
           </div>
+        )}
 
-          {/* Status line */}
-          <div style={{ marginTop: 12, fontSize: 13 }}>
-            <span style={{ fontWeight: 900 }}>
-              Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This
-              interval: {thisIntervalCount}
-            </span>
-            {statusMsg ? (
-              <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 800 }}>
-                {statusMsg}
-              </span>
-            ) : null}
-            {lastRecorded ? <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div> : null}
-          </div>
-        </div>
+        {/* ===== REVIEW TAB ===== */}
+        {tab === "review" && (
+          <>
+            {/* Review controls */}
+            <div
+              style={{
+                border: "1px solid #e5e7eb",
+                borderRadius: 14,
+                padding: 14,
+                background: "#fff",
+                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+              }}
+            >
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button style={styles.buttonSecondary} onClick={exportCSV} disabled={!markers.length}>
+                    Export CSV
+                  </button>
 
-        {/* LEGEND */}
-        <div
-          style={{
-            marginTop: 12,
-            border: "1px solid #e5e7eb",
-            borderRadius: 14,
-            padding: 12,
-            background: "#fff",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-          }}
-        >
-          <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 8 }}>Legend</div>
+                  <button style={styles.buttonSecondary} onClick={onPickCSV}>
+                    Load CSV (replay)
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,text/csv"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleImportCSV(f);
+                      if (e.target) e.target.value = "";
+                    }}
+                  />
 
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-            {ACTIVITY.map((a) => (
-              <span
-                key={a.key}
+                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ opacity: 0.75 }}>Import mode</span>
+                    <select
+                      style={{ ...styles.select, width: 160, padding: "8px 10px" }}
+                      value={importMode}
+                      onChange={(e) => setImportMode(e.target.value as any)}
+                    >
+                      <option value="replace">Replace</option>
+                      <option value="append">Append</option>
+                    </select>
+                  </label>
+
+                  <button
+                    style={{
+                      ...styles.buttonSecondary,
+                      borderColor:
+                        testStatus === "failed"
+                          ? "#ef4444"
+                          : testStatus === "sent"
+                          ? "#22c55e"
+                          : "#d0d5dd",
+                    }}
+                    onClick={sendTestRow}
+                    disabled={testStatus === "sending"}
+                  >
+                    {testButtonLabel}
+                  </button>
+                </div>
+
+                <div style={{ fontSize: 12, opacity: 0.85 }}>
+                  {testHint ? (
+                    <span>{testHint}</span>
+                  ) : (
+                    <span>
+                      Tip: Use <b>Load CSV</b> to replay previous sessions.
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Playback */}
+              <div
                 style={{
-                  display: "inline-flex",
-                  gap: 8,
+                  marginTop: 12,
+                  paddingTop: 12,
+                  borderTop: "1px solid #eef2f7",
+                  display: "flex",
+                  gap: 12,
                   alignItems: "center",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 999,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  fontWeight: 800,
+                  flexWrap: "wrap",
                 }}
-                title={`${a.label} (${legendCounts.byActivity.get(a.key) || 0})`}
               >
-                <span
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
+                  <input
+                    type="checkbox"
+                    checked={playbackEnabled}
+                    onChange={(e) => setPlaybackEnabled(e.target.checked)}
+                  />
+                  Playback
+                </label>
+
+                {playbackEnabled && (
+                  <>
+                    <button
+                      style={styles.buttonSecondary}
+                      onClick={() => setIsPlaying((p) => !p)}
+                      disabled={markersSorted.length === 0}
+                    >
+                      {isPlaying ? "Pause replay" : "Play replay"}
+                    </button>
+
+                    <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                      <span style={{ opacity: 0.75 }}>Speed</span>
+                      <select
+                        style={{ ...styles.select, width: 110, padding: "8px 10px" }}
+                        value={playbackSpeed}
+                        onChange={(e) => setPlaybackSpeed(Number(e.target.value) as any)}
+                      >
+                        <option value={1}>1×</option>
+                        <option value={2}>2×</option>
+                        <option value={4}>4×</option>
+                        <option value={8}>8×</option>
+                      </select>
+                    </label>
+
+                    <button
+                      style={styles.buttonSecondary}
+                      onClick={() => {
+                        setIsPlaying(false);
+                        setPlaybackPos(0);
+                      }}
+                      disabled={markersSorted.length === 0}
+                    >
+                      Rewind
+                    </button>
+
+                    <button
+                      style={styles.buttonSecondary}
+                      onClick={() => {
+                        setIsPlaying(false);
+                        setPlaybackPos(1000);
+                      }}
+                      disabled={markersSorted.length === 0}
+                    >
+                      End
+                    </button>
+                  </>
+                )}
+
+                <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>
+                  {playbackEnabled ? playbackLabel ?? "Playback: no data yet." : "Playback is off."}
+                </div>
+
+                {playbackEnabled && (
+                  <div style={{ width: "100%" }}>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1000}
+                      value={playbackPos}
+                      onChange={(e) => {
+                        setIsPlaying(false);
+                        setPlaybackPos(Number(e.target.value));
+                      }}
+                      style={{ width: "100%" }}
+                      disabled={markersSorted.length === 0}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Filters */}
+              <div style={{ marginTop: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ fontWeight: 900, fontSize: 13 }}>Filters</div>
+                  <button style={styles.buttonSecondary} onClick={clearFilters}>
+                    Clear filters
+                  </button>
+                </div>
+
+                <div
                   style={{
-                    width: 10,
-                    height: 10,
-                    borderRadius: 999,
-                    background: a.color,
+                    marginTop: 10,
+                    display: "grid",
+                    gridTemplateColumns: "1.2fr 1fr 1fr auto",
+                    gap: 12,
+                    alignItems: "end",
                   }}
-                />
-                {a.label} ({legendCounts.byActivity.get(a.key) || 0})
-              </span>
-            ))}
-          </div>
+                >
+                  <div>
+                    <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Badge contains</div>
+                    <input
+                      style={styles.input}
+                      value={filterBadge}
+                      onChange={(e) => setFilterBadge(e.target.value)}
+                      placeholder="e.g., 014"
+                    />
+                  </div>
 
-          <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 14, fontSize: 12 }}>
-            <span>
-              <b>Dot ring</b>:{" "}
-              <span style={{ borderBottom: "2px solid rgba(34,197,94,0.9)" }}>green</span> = cloud ok,{" "}
-              <span style={{ borderBottom: "2px solid rgba(239,68,68,0.95)" }}>red</span> = cloud fail,{" "}
-              <span style={{ borderBottom: "2px solid rgba(0,0,0,0.1)" }}>white</span> = pending
-            </span>
-            <span>
-              <b>Source</b>: live = solid dot; imported = dashed outline
-            </span>
-          </div>
-        </div>
+                  <div>
+                    <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
+                    <select
+                      style={styles.select}
+                      value={filterRole}
+                      onChange={(e) => setFilterRole(e.target.value as any)}
+                    >
+                      <option value="all">All roles</option>
+                      {ROLES.map((r) => (
+                        <option key={r.key} value={r.key}>
+                          {r.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-        {/* PLAN CARD */}
+                  <div>
+                    <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Activity</div>
+                    <select
+                      style={styles.select}
+                      value={filterActivity}
+                      onChange={(e) => setFilterActivity(e.target.value as any)}
+                    >
+                      <option value="all">All activities</option>
+                      {ACTIVITY.map((a) => (
+                        <option key={a.key} value={a.key}>
+                          {a.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 900 }}>
+                    <input
+                      type="checkbox"
+                      checked={filterGroupOnly}
+                      onChange={(e) => setFilterGroupOnly(e.target.checked)}
+                    />
+                    Group only
+                  </label>
+                </div>
+
+                <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <span style={styles.pill}>Showing: {reviewMarkers.length}</span>
+                  <span style={styles.pill}>Total stored: {markers.length}</span>
+                  <span style={styles.pill}>Live: {legendCounts.live}</span>
+                  <span style={styles.pill}>Imported: {legendCounts.imp}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Legend */}
+            <div
+              style={{
+                marginTop: 12,
+                border: "1px solid #e5e7eb",
+                borderRadius: 14,
+                padding: 12,
+                background: "#fff",
+                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 8 }}>Legend</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+                {ACTIVITY.map((a) => (
+                  <span
+                    key={a.key}
+                    style={{
+                      display: "inline-flex",
+                      gap: 8,
+                      alignItems: "center",
+                      border: "1px solid #e5e7eb",
+                      borderRadius: 999,
+                      padding: "6px 10px",
+                      fontSize: 12,
+                      fontWeight: 900,
+                    }}
+                    title={`${a.label} (${legendCounts.byActivity.get(a.key) || 0})`}
+                  >
+                    <span
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: 999,
+                        background: a.color,
+                      }}
+                    />
+                    {a.label} ({legendCounts.byActivity.get(a.key) || 0})
+                  </span>
+                ))}
+              </div>
+              <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 14, fontSize: 12 }}>
+                <span>
+                  <b>Dot ring</b>: green = cloud ok, red = cloud fail, white = pending
+                </span>
+                <span>
+                  <b>Source</b>: live = solid; imported = dashed outline
+                </span>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* PLAN CARD (shared) */}
         <div
           style={{
             marginTop: 14,
@@ -1255,13 +1218,16 @@ export default function Page() {
           }}
         >
           <div style={{ padding: 10, borderBottom: "1px solid #eef2f7", fontSize: 13 }}>
-            <b>Click on the plan</b> to record a point. (Badge required.) Selected activity:{" "}
-            <b>{selectedActivityMeta.label}</b>
-            {playbackEnabled ? (
-              <span style={{ marginLeft: 10, opacity: 0.75 }}>
-                · Playback ON (showing up to slider time)
-              </span>
-            ) : null}
+            <b>Plan</b> · Mode: <b>{tab === "collect" ? "Collect" : "Review"}</b>{" "}
+            {tab === "collect" ? (
+              <>
+                · Click to record. Selected activity: <b>{selectedActivityMeta.label}</b>
+              </>
+            ) : (
+              <>
+                · Showing filtered markers {playbackEnabled ? "(with playback)" : ""}.
+              </>
+            )}
           </div>
 
           <div
@@ -1272,7 +1238,7 @@ export default function Page() {
               height: "72vh",
               minHeight: 560,
               background: "#fafafa",
-              cursor: isRunning ? "crosshair" : "not-allowed",
+              cursor: tab === "collect" && isRunning ? "crosshair" : "default",
             }}
           >
             <img
@@ -1289,7 +1255,7 @@ export default function Page() {
               }}
             />
 
-            {playbackMarkers.map((m) => {
+            {markersToRender.map((m) => {
               const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
               const ring =
                 m.cloudStatus === "ok"
@@ -1297,7 +1263,6 @@ export default function Page() {
                   : m.cloudStatus === "fail"
                   ? "2px solid rgba(239,68,68,0.95)"
                   : "2px solid rgba(255,255,255,0.95)";
-
               const isImport = (m.source ?? "live") === "import";
 
               return (
@@ -1339,6 +1304,49 @@ export default function Page() {
         <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
           Zones: edit the <b>ZONES</b> array near the top of the file to match your plan.
         </div>
+      </div>
+
+      {/* ===== BOTTOM TAB BAR ===== */}
+      <div
+        style={{
+          position: "fixed",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          borderTop: "1px solid #e5e7eb",
+          background: "rgba(255,255,255,0.98)",
+          backdropFilter: "blur(8px)",
+          padding: "10px 14px",
+          display: "flex",
+          justifyContent: "center",
+          gap: 10,
+          zIndex: 50,
+        }}
+      >
+        <button
+          onClick={() => setTab("collect")}
+          style={{
+            ...styles.buttonSecondary,
+            borderColor: tab === "collect" ? "#111" : "#d0d5dd",
+            background: tab === "collect" ? "#111" : "#fff",
+            color: tab === "collect" ? "#fff" : "#111",
+            minWidth: 140,
+          }}
+        >
+          Collect
+        </button>
+        <button
+          onClick={() => setTab("review")}
+          style={{
+            ...styles.buttonSecondary,
+            borderColor: tab === "review" ? "#111" : "#d0d5dd",
+            background: tab === "review" ? "#111" : "#fff",
+            color: tab === "review" ? "#fff" : "#111",
+            minWidth: 140,
+          }}
+        >
+          Review
+        </button>
       </div>
     </div>
   );
