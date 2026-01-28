@@ -7,7 +7,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 ======================= */
 
 const SHEETS_WEBHOOK_URL =
-  "https://script.google.com/macros/s/AKfycbyugME76aytvUGe4jgVjSjFDfxRA9bm4nirvrtQ2dhyqHML531fmZe-J3NIGbE4UlSR/exec";
+  "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
 
 /* =======================
    TYPES & CONSTANTS
@@ -77,6 +77,7 @@ type Marker = {
   note: string;
 
   cloudStatus?: "pending" | "ok" | "fail";
+  source?: "live" | "import";
 };
 
 /* =======================
@@ -114,6 +115,9 @@ function pad2(n: number) {
 function formatHM(d: Date) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
+function formatHMS(d: Date) {
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
 function formatIntervalLabel(start: Date, durationSeconds: number) {
   const end = new Date(start.getTime() + durationSeconds * 1000);
   return `${formatHM(start)}–${formatHM(end)}`;
@@ -124,8 +128,53 @@ function csvEscape(value: string) {
   return v;
 }
 
+/**
+ * Robust-enough CSV parser for our exported CSV.
+ */
+function parseCSV(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cell += c;
+      }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ",") {
+        row.push(cell);
+        cell = "";
+      } else if (c === "\n") {
+        row.push(cell);
+        rows.push(row);
+        row = [];
+        cell = "";
+      } else if (c !== "\r") {
+        cell += c;
+      }
+    }
+  }
+
+  row.push(cell);
+  rows.push(row);
+
+  return rows.filter((r) => r.some((x) => x.trim() !== ""));
+}
+
 /* =======================
-   UI HELPERS
+   UI STYLES
 ======================= */
 
 const styles = {
@@ -165,6 +214,14 @@ const styles = {
     fontWeight: 700,
     cursor: "pointer",
   } as React.CSSProperties,
+  pill: {
+    padding: "6px 10px",
+    borderRadius: 999,
+    border: "1px solid #d0d5dd",
+    background: "#fff",
+    fontSize: 12,
+    fontWeight: 700,
+  } as React.CSSProperties,
 };
 
 /* =======================
@@ -178,12 +235,11 @@ async function sendToSheets(payload: Record<string, any>) {
   await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     mode: "no-cors",
-    // text/plain avoids preflight; Apps Script still receives e.postData.contents
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(payload),
   });
 
-  // In no-cors mode we cannot read the response. If fetch resolves, it was sent.
+  // no-cors: we can't read response; resolved fetch means "sent".
   return true;
 }
 
@@ -194,39 +250,57 @@ async function sendToSheets(payload: Record<string, any>) {
 export default function Page() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
+  // Session settings
   const [observerName, setObserverName] = useState("Observer 1");
   const [buildingSite, setBuildingSite] = useState("Habitat A");
   const [intervalMinutes, setIntervalMinutes] = useState(5);
-
   const intervalSeconds = useMemo(() => Math.max(1, intervalMinutes * 60), [intervalMinutes]);
 
+  // Current “recording” state
   const [badgeNumber, setBadgeNumber] = useState("");
   const [role, setRole] = useState<RoleType>("pilot");
   const [activity, setActivity] = useState<ActivityType>("walking");
   const [isGroup, setIsGroup] = useState(false);
   const [note, setNote] = useState("");
 
+  // Timer
   const [isRunning, setIsRunning] = useState(false);
   const [intervalIndex, setIntervalIndex] = useState(0);
   const [intervalStart, setIntervalStart] = useState<number | null>(null);
   const [timeLeft, setTimeLeft] = useState(intervalSeconds);
 
+  // Data
   const [markers, setMarkers] = useState<Marker[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>("");
   const [lastRecorded, setLastRecorded] = useState<string>("");
 
   // TEST status
-  const [testStatus, setTestStatus] = useState<
-    "idle" | "sending" | "sent" | "failed"
-  >("idle");
+  const [testStatus, setTestStatus] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [testHint, setTestHint] = useState<string>("");
 
-  // Keep timeLeft synced when not running
+  // CSV import
+  const [importMode, setImportMode] = useState<"replace" | "append">("replace");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Filters
+  const [filterBadge, setFilterBadge] = useState("");
+  const [filterRole, setFilterRole] = useState<RoleType | "all">("all");
+  const [filterActivity, setFilterActivity] = useState<ActivityType | "all">("all");
+  const [filterGroupOnly, setFilterGroupOnly] = useState(false);
+
+  // Playback
+  const [playbackEnabled, setPlaybackEnabled] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState<1 | 2 | 4 | 8>(2);
+  // Slider is 0..1000 (stable UI), maps to time window
+  const [playbackPos, setPlaybackPos] = useState(1000);
+
+  // keep timeLeft synced when not running
   useEffect(() => {
     if (!isRunning) setTimeLeft(intervalSeconds);
   }, [intervalSeconds, isRunning]);
 
-  // Timer tick
+  // timer tick
   useEffect(() => {
     if (!isRunning || intervalStart === null) return;
 
@@ -260,6 +334,58 @@ export default function Page() {
     [activity]
   );
 
+  // Sorted markers (stable for playback)
+  const markersSorted = useMemo(() => {
+    return [...markers].sort((a, b) => a.createdAt - b.createdAt);
+  }, [markers]);
+
+  const playbackWindow = useMemo(() => {
+    if (markersSorted.length === 0) return null;
+    const minT = markersSorted[0].createdAt;
+    const maxT = markersSorted[markersSorted.length - 1].createdAt;
+    return { minT, maxT };
+  }, [markersSorted]);
+
+  const playbackCutoffTime = useMemo(() => {
+    if (!playbackWindow) return null;
+    const { minT, maxT } = playbackWindow;
+    const t = minT + ((maxT - minT) * playbackPos) / 1000;
+    return t;
+  }, [playbackWindow, playbackPos]);
+
+  // playback tick
+  useEffect(() => {
+    if (!playbackEnabled || !isPlaying) return;
+    if (!playbackWindow) return;
+
+    const { minT, maxT } = playbackWindow;
+    const total = Math.max(1, maxT - minT);
+    const stepMs = 120 * playbackSpeed; // feel-good speed; adjust anytime
+
+    const id = setInterval(() => {
+      setPlaybackPos((p) => {
+        const currentT = minT + (total * p) / 1000;
+        const nextT = currentT + stepMs;
+        const nextP = Math.round(((nextT - minT) / total) * 1000);
+
+        if (nextP >= 1000) {
+          // stop at end
+          setIsPlaying(false);
+          return 1000;
+        }
+        return Math.max(0, Math.min(1000, nextP));
+      });
+    }, 120);
+
+    return () => clearInterval(id);
+  }, [playbackEnabled, isPlaying, playbackSpeed, playbackWindow]);
+
+  // If user turns on playback, default to end
+  useEffect(() => {
+    if (playbackEnabled) setPlaybackPos(1000);
+    setIsPlaying(false);
+  }, [playbackEnabled]);
+
   function start() {
     const now = Date.now();
     setIntervalStart(now);
@@ -290,6 +416,9 @@ export default function Page() {
     setMarkers([]);
     setStatusMsg("Reset");
     setLastRecorded("");
+    setIsPlaying(false);
+    setPlaybackEnabled(false);
+    setPlaybackPos(1000);
   }
 
   function exportCSV() {
@@ -309,6 +438,7 @@ export default function Page() {
       "zone",
       "note",
       "cloud_status",
+      "source",
     ];
 
     const rows = markers.map((m) => {
@@ -328,6 +458,7 @@ export default function Page() {
         m.zone,
         m.note ?? "",
         m.cloudStatus ?? "",
+        m.source ?? "live",
       ].map(csvEscape);
     });
 
@@ -365,14 +496,107 @@ export default function Page() {
 
       setTestStatus("sent");
       setTestHint("Sent ✓ Now check the Google Sheet (tab: observations).");
-
-      // auto-reset indicator after a moment
       window.setTimeout(() => setTestStatus("idle"), 3500);
-    } catch (err: any) {
+    } catch {
       setTestStatus("failed");
-      setTestHint(
-        "Failed. Likely Apps Script deployment settings. See notes below."
-      );
+      setTestHint("Failed. Likely deployment settings or URL mismatch.");
+    }
+  }
+
+  function onPickCSV() {
+    fileInputRef.current?.click();
+  }
+
+  async function handleImportCSV(file: File) {
+    setStatusMsg("");
+    try {
+      const text = await file.text();
+      const rows = parseCSV(text);
+
+      if (rows.length < 2) {
+        setStatusMsg("CSV looks empty.");
+        return;
+      }
+
+      const header = rows[0].map((h) => h.trim());
+      const idx = (name: string) => header.indexOf(name);
+
+      const required = [
+        "created_at_iso",
+        "observer",
+        "site",
+        "interval_minutes",
+        "interval_index",
+        "interval_label",
+        "badge",
+        "role",
+        "activity",
+        "group",
+        "x_norm",
+        "y_norm",
+        "zone",
+        "note",
+      ];
+
+      const missing = required.filter((k) => idx(k) === -1);
+      if (missing.length) {
+        setStatusMsg(`CSV missing columns: ${missing.join(", ")}`);
+        return;
+      }
+
+      const roleKeys = new Set(ROLES.map((r) => r.key));
+      const activityKeys = new Set(ACTIVITY.map((a) => a.key));
+
+      const imported: Marker[] = rows.slice(1).map((r) => {
+        const createdAt = Date.parse(r[idx("created_at_iso")] || "") || Date.now();
+
+        const x = Number(r[idx("x_norm")] || 0);
+        const y = Number(r[idx("y_norm")] || 0);
+
+        const roleRaw = (r[idx("role")] || "pilot") as RoleType;
+        const activityRaw = (r[idx("activity")] || "walking") as ActivityType;
+
+        const safeRole: RoleType = roleKeys.has(roleRaw) ? roleRaw : "visitor_other";
+        const safeActivity: ActivityType = activityKeys.has(activityRaw) ? activityRaw : "walking";
+
+        const groupStr = String(r[idx("group")] || "").trim();
+        const isGroup = groupStr === "1" || groupStr.toLowerCase() === "true";
+
+        return {
+          id: uid(),
+          createdAt,
+          intervalIndex: Number(r[idx("interval_index")] || 0),
+          intervalLabel: r[idx("interval_label")] || "—",
+
+          observerName: r[idx("observer")] || "Observer 1",
+          buildingSite: r[idx("site")] || "Habitat A",
+
+          badgeNumber: r[idx("badge")] || "",
+          role: safeRole,
+
+          activity: safeActivity,
+          isGroup,
+
+          x: isFinite(x) ? Math.min(1, Math.max(0, x)) : 0,
+          y: isFinite(y) ? Math.min(1, Math.max(0, y)) : 0,
+
+          zone: r[idx("zone")] || zoneForPoint(x, y),
+          note: r[idx("note")] || "",
+          cloudStatus: "ok",
+          source: "import",
+        };
+      });
+
+      if (importMode === "replace") setMarkers(imported);
+      else setMarkers((prev) => [...prev, ...imported]);
+
+      setPlaybackEnabled(true);
+      setPlaybackPos(1000);
+      setIsPlaying(false);
+
+      setStatusMsg(`Loaded ${imported.length} markers from CSV (${importMode}).`);
+    } catch (err: any) {
+      setStatusMsg(`Import failed: ${String(err)}`);
     }
   }
 
@@ -414,15 +638,16 @@ export default function Page() {
       zone,
       note,
       cloudStatus: "pending",
+      source: "live",
     };
 
-    // Optimistic UI
     setMarkers((prev) => [...prev, base]);
     setLastRecorded(
-      `Recorded: badge ${base.badgeNumber} · ${ROLES.find((r) => r.key === base.role)?.label} · ${selectedActivityMeta.label} · ${base.zone}`
+      `Recorded: badge ${base.badgeNumber} · ${ROLES.find((r) => r.key === base.role)?.label} · ${
+        ACTIVITY.find((a) => a.key === base.activity)?.label
+      } · ${base.zone}`
     );
 
-    // Send to Sheets: if network-level error occurs, mark fail
     sendToSheets({
       created_at_iso: new Date(base.createdAt).toISOString(),
       observer: base.observerName,
@@ -442,26 +667,62 @@ export default function Page() {
       .then(() => {
         setMarkers((prev) => {
           const copy = [...prev];
-          const idx = copy.findIndex((m) => m.id === base.id);
-          if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "ok" };
+          const i = copy.findIndex((m) => m.id === base.id);
+          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "ok" };
           return copy;
         });
       })
       .catch(() => {
         setMarkers((prev) => {
           const copy = [...prev];
-          const idx = copy.findIndex((m) => m.id === base.id);
-          if (idx >= 0) copy[idx] = { ...copy[idx], cloudStatus: "fail" };
+          const i = copy.findIndex((m) => m.id === base.id);
+          if (i >= 0) copy[i] = { ...copy[i], cloudStatus: "fail" };
           return copy;
         });
         setStatusMsg("Saved locally; cloud may not have received it.");
       });
   }
 
+  // Filter + playback pipeline
+  const filteredMarkers = useMemo(() => {
+    const badgeQ = filterBadge.trim().toLowerCase();
+
+    return markersSorted.filter((m) => {
+      if (filterRole !== "all" && m.role !== filterRole) return false;
+      if (filterActivity !== "all" && m.activity !== filterActivity) return false;
+      if (filterGroupOnly && !m.isGroup) return false;
+      if (badgeQ) {
+        const b = (m.badgeNumber || "").toLowerCase();
+        if (!b.includes(badgeQ)) return false;
+      }
+      return true;
+    });
+  }, [markersSorted, filterBadge, filterRole, filterActivity, filterGroupOnly]);
+
+  const playbackMarkers = useMemo(() => {
+    if (!playbackEnabled || !playbackCutoffTime) return filteredMarkers;
+    return filteredMarkers.filter((m) => m.createdAt <= playbackCutoffTime);
+  }, [filteredMarkers, playbackEnabled, playbackCutoffTime]);
+
   const thisIntervalCount = useMemo(
     () => markers.filter((m) => m.intervalIndex === intervalIndex).length,
     [markers, intervalIndex]
   );
+
+  const playbackLabel = useMemo(() => {
+    if (!playbackEnabled || !playbackWindow || playbackCutoffTime === null) return null;
+    const t = new Date(playbackCutoffTime);
+    const minT = new Date(playbackWindow.minT);
+    const maxT = new Date(playbackWindow.maxT);
+    return `Playback time: ${formatHMS(t)} (from ${formatHMS(minT)} to ${formatHMS(maxT)})`;
+  }, [playbackEnabled, playbackWindow, playbackCutoffTime]);
+
+  function clearFilters() {
+    setFilterBadge("");
+    setFilterRole("all");
+    setFilterActivity("all");
+    setFilterGroupOnly(false);
+  }
 
   const testButtonLabel =
     testStatus === "sending"
@@ -471,6 +732,18 @@ export default function Page() {
       : testStatus === "failed"
       ? "Failed ✕"
       : "Send TEST row";
+
+  // Legend counts
+  const legendCounts = useMemo(() => {
+    const byActivity = new Map<ActivityType, number>();
+    for (const a of ACTIVITY) byActivity.set(a.key, 0);
+    for (const m of playbackMarkers) byActivity.set(m.activity, (byActivity.get(m.activity) || 0) + 1);
+
+    const live = playbackMarkers.filter((m) => (m.source ?? "live") === "live").length;
+    const imp = playbackMarkers.filter((m) => m.source === "import").length;
+
+    return { byActivity, live, imp, total: playbackMarkers.length };
+  }, [playbackMarkers]);
 
   return (
     <div style={{ background: "#fff", minHeight: "100vh", color: "#111" }}>
@@ -486,9 +759,7 @@ export default function Page() {
       >
         <img src="/logoCCAweb.png" alt="CCA logo" style={{ height: 46 }} />
         <div style={{ display: "flex", flexDirection: "column" }}>
-          <div style={{ fontWeight: 800, fontSize: 16 }}>
-            Analogue Mission Observation Mapper
-          </div>
+          <div style={{ fontWeight: 800, fontSize: 16 }}>Analogue Mission Observation Mapper</div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>University of Cambridge</div>
         </div>
       </header>
@@ -508,7 +779,7 @@ export default function Page() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.4fr",
+              gridTemplateColumns: "1.2fr 1.2fr 0.8fr 1.6fr",
               gap: 12,
               alignItems: "end",
             }}
@@ -574,6 +845,7 @@ export default function Page() {
               >
                 Export CSV
               </button>
+
               <button
                 style={{
                   ...styles.buttonSecondary,
@@ -589,19 +861,137 @@ export default function Page() {
               >
                 {testButtonLabel}
               </button>
+
+              <button style={styles.buttonSecondary} onClick={onPickCSV}>
+                Load CSV (replay)
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv,text/csv"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleImportCSV(f);
+                  if (e.target) e.target.value = "";
+                }}
+              />
             </div>
           </div>
 
-          {/* TEST hint */}
-          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
-            {testHint ? (
-              <span>{testHint}</span>
-            ) : (
-              <span>
-                Cloud test: sends a row with badge <b>TEST</b> to the Google Sheet.
-              </span>
-            )}
+          {/* Row 1.5: import mode + playback toggle */}
+          <div
+            style={{
+              marginTop: 10,
+              display: "flex",
+              gap: 14,
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                <span style={{ opacity: 0.75 }}>Import mode</span>
+                <select
+                  style={{ ...styles.select, width: 160, padding: "8px 10px" }}
+                  value={importMode}
+                  onChange={(e) => setImportMode(e.target.value as any)}
+                >
+                  <option value="replace">Replace</option>
+                  <option value="append">Append</option>
+                </select>
+              </label>
+
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
+                <input
+                  type="checkbox"
+                  checked={playbackEnabled}
+                  onChange={(e) => setPlaybackEnabled(e.target.checked)}
+                />
+                Playback
+              </label>
+
+              {playbackEnabled && (
+                <>
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => setIsPlaying((p) => !p)}
+                    disabled={markersSorted.length === 0}
+                  >
+                    {isPlaying ? "Pause replay" : "Play replay"}
+                  </button>
+
+                  <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ opacity: 0.75 }}>Speed</span>
+                    <select
+                      style={{ ...styles.select, width: 110, padding: "8px 10px" }}
+                      value={playbackSpeed}
+                      onChange={(e) => setPlaybackSpeed(Number(e.target.value) as any)}
+                    >
+                      <option value={1}>1×</option>
+                      <option value={2}>2×</option>
+                      <option value={4}>4×</option>
+                      <option value={8}>8×</option>
+                    </select>
+                  </label>
+
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setPlaybackPos(0);
+                    }}
+                    disabled={markersSorted.length === 0}
+                  >
+                    Rewind
+                  </button>
+
+                  <button
+                    style={styles.buttonSecondary}
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setPlaybackPos(1000);
+                    }}
+                    disabled={markersSorted.length === 0}
+                  >
+                    End
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div style={{ fontSize: 12, opacity: 0.85 }}>
+              {testHint ? (
+                <span>{testHint}</span>
+              ) : (
+                <span>
+                  Cloud test sends a row with badge <b>TEST</b> to your Sheet.
+                </span>
+              )}
+            </div>
           </div>
+
+          {/* Playback slider */}
+          {playbackEnabled && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                {playbackLabel ?? "Playback: load data or record markers to enable timeline."}
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={1000}
+                value={playbackPos}
+                onChange={(e) => {
+                  setIsPlaying(false);
+                  setPlaybackPos(Number(e.target.value));
+                }}
+                style={{ width: "100%" }}
+                disabled={markersSorted.length === 0}
+              />
+            </div>
+          )}
 
           {/* Row 2 */}
           <div
@@ -650,7 +1040,7 @@ export default function Page() {
               />
             </div>
 
-            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
               <input
                 type="checkbox"
                 checked={isGroup}
@@ -699,24 +1089,157 @@ export default function Page() {
             </div>
           </div>
 
+          {/* FILTERS */}
+          <div
+            style={{
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: "1px solid #eef2f7",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 900, fontSize: 13 }}>Filters (what you see on the plan)</div>
+              <button style={styles.buttonSecondary} onClick={clearFilters}>
+                Clear filters
+              </button>
+            </div>
+
+            <div
+              style={{
+                marginTop: 10,
+                display: "grid",
+                gridTemplateColumns: "1.2fr 1fr 1fr auto",
+                gap: 12,
+                alignItems: "end",
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Badge contains</div>
+                <input
+                  style={styles.input}
+                  value={filterBadge}
+                  onChange={(e) => setFilterBadge(e.target.value)}
+                  placeholder="e.g., 014"
+                />
+              </div>
+
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Role</div>
+                <select
+                  style={styles.select}
+                  value={filterRole}
+                  onChange={(e) => setFilterRole(e.target.value as any)}
+                >
+                  <option value="all">All roles</option>
+                  {ROLES.map((r) => (
+                    <option key={r.key} value={r.key}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>Activity</div>
+                <select
+                  style={styles.select}
+                  value={filterActivity}
+                  onChange={(e) => setFilterActivity(e.target.value as any)}
+                >
+                  <option value="all">All activities</option>
+                  {ACTIVITY.map((a) => (
+                    <option key={a.key} value={a.key}>
+                      {a.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 800 }}>
+                <input
+                  type="checkbox"
+                  checked={filterGroupOnly}
+                  onChange={(e) => setFilterGroupOnly(e.target.checked)}
+                />
+                Group only
+              </label>
+            </div>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <span style={styles.pill}>Showing: {playbackMarkers.length}</span>
+              <span style={styles.pill}>Total stored: {markers.length}</span>
+              <span style={styles.pill}>Live: {legendCounts.live}</span>
+              <span style={styles.pill}>Imported: {legendCounts.imp}</span>
+            </div>
+          </div>
+
           {/* Status line */}
-          <div style={{ marginTop: 10, fontSize: 13 }}>
-            <span style={{ fontWeight: 800 }}>
+          <div style={{ marginTop: 12, fontSize: 13 }}>
+            <span style={{ fontWeight: 900 }}>
               Interval: {intervalLabel} · Time left: {timerText} · Markers: {markers.length} · This
               interval: {thisIntervalCount}
             </span>
             {statusMsg ? (
-              <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 700 }}>
+              <span style={{ marginLeft: 10, color: "#b42318", fontWeight: 800 }}>
                 {statusMsg}
               </span>
             ) : null}
-            {lastRecorded ? (
-              <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div>
-            ) : null}
-            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-              Cloud logging: Google Sheets (no-auth). If TEST doesn’t appear, fix Apps Script deploy:
-              Execute as <b>Me</b>, Access <b>Anyone with the link</b>, then redeploy/update.
-            </div>
+            {lastRecorded ? <div style={{ marginTop: 6, opacity: 0.8 }}>{lastRecorded}</div> : null}
+          </div>
+        </div>
+
+        {/* LEGEND */}
+        <div
+          style={{
+            marginTop: 12,
+            border: "1px solid #e5e7eb",
+            borderRadius: 14,
+            padding: 12,
+            background: "#fff",
+            boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+          }}
+        >
+          <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 8 }}>Legend</div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            {ACTIVITY.map((a) => (
+              <span
+                key={a.key}
+                style={{
+                  display: "inline-flex",
+                  gap: 8,
+                  alignItems: "center",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 999,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                }}
+                title={`${a.label} (${legendCounts.byActivity.get(a.key) || 0})`}
+              >
+                <span
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: 999,
+                    background: a.color,
+                  }}
+                />
+                {a.label} ({legendCounts.byActivity.get(a.key) || 0})
+              </span>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 14, fontSize: 12 }}>
+            <span>
+              <b>Dot ring</b>:{" "}
+              <span style={{ borderBottom: "2px solid rgba(34,197,94,0.9)" }}>green</span> = cloud ok,{" "}
+              <span style={{ borderBottom: "2px solid rgba(239,68,68,0.95)" }}>red</span> = cloud fail,{" "}
+              <span style={{ borderBottom: "2px solid rgba(0,0,0,0.1)" }}>white</span> = pending
+            </span>
+            <span>
+              <b>Source</b>: live = solid dot; imported = dashed outline
+            </span>
           </div>
         </div>
 
@@ -734,6 +1257,11 @@ export default function Page() {
           <div style={{ padding: 10, borderBottom: "1px solid #eef2f7", fontSize: 13 }}>
             <b>Click on the plan</b> to record a point. (Badge required.) Selected activity:{" "}
             <b>{selectedActivityMeta.label}</b>
+            {playbackEnabled ? (
+              <span style={{ marginLeft: 10, opacity: 0.75 }}>
+                · Playback ON (showing up to slider time)
+              </span>
+            ) : null}
           </div>
 
           <div
@@ -741,8 +1269,8 @@ export default function Page() {
             onClick={handleClick}
             style={{
               position: "relative",
-              height: "70vh",
-              minHeight: 520,
+              height: "72vh",
+              minHeight: 560,
               background: "#fafafa",
               cursor: isRunning ? "crosshair" : "not-allowed",
             }}
@@ -761,7 +1289,7 @@ export default function Page() {
               }}
             />
 
-            {markers.map((m) => {
+            {playbackMarkers.map((m) => {
               const color = ACTIVITY.find((a) => a.key === m.activity)?.color ?? "#111";
               const ring =
                 m.cloudStatus === "ok"
@@ -770,10 +1298,24 @@ export default function Page() {
                   ? "2px solid rgba(239,68,68,0.95)"
                   : "2px solid rgba(255,255,255,0.95)";
 
+              const isImport = (m.source ?? "live") === "import";
+
               return (
                 <div
                   key={m.id}
-                  title={`Badge ${m.badgeNumber} · ${m.role} · ${m.activity} · ${m.zone} · ${m.intervalLabel} · cloud=${m.cloudStatus}`}
+                  title={[
+                    `Time: ${formatHMS(new Date(m.createdAt))}`,
+                    `Badge: ${m.badgeNumber}`,
+                    `Role: ${m.role}`,
+                    `Activity: ${m.activity}`,
+                    `Zone: ${m.zone}`,
+                    `Interval: ${m.intervalLabel}`,
+                    `Source: ${m.source ?? "live"}`,
+                    `Cloud: ${m.cloudStatus ?? "pending"}`,
+                    m.note ? `Note: ${m.note}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                   style={{
                     position: "absolute",
                     left: `${m.x * 100}%`,
@@ -784,6 +1326,7 @@ export default function Page() {
                     borderRadius: 999,
                     background: color,
                     border: ring,
+                    outline: isImport ? "2px dashed rgba(0,0,0,0.35)" : "none",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
                     zIndex: 5,
                   }}
@@ -794,8 +1337,7 @@ export default function Page() {
         </div>
 
         <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-          Zones: edit the <b>ZONES</b> array near the top of the file to match your plan. Each zone is
-          a rectangle in normalized coordinates (0..1).
+          Zones: edit the <b>ZONES</b> array near the top of the file to match your plan.
         </div>
       </div>
     </div>
