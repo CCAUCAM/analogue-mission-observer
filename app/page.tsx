@@ -7,7 +7,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 ======================= */
 
 const SHEETS_WEBHOOK_URL =
-  "https://script.google.com/macros/s/AKfycbxU6RovW_blp676-YSxvcux6PBZWfhhYhQzDefXfX6ftQvY53UKUh2-PqQH8yPtJ3Df/exec";
+  "https://script.google.com/macros/s/AKfycbyugME76aytvUGe4jgVjSjFDfxRA9bm4nirvrtQ2dhyqHML531fmZe-J3NIGbE4UlSR/exec";
 
 /* =======================
    TYPES & CONSTANTS
